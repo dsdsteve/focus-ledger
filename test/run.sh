@@ -86,6 +86,32 @@ run_park_check() {
   rm -rf "$home"
 }
 
+# --- setup: idempotent CLAUDE.md block; preserves existing content; clean remove ---
+run_setup_check() {
+  sh_bin=$1
+  command -v "$sh_bin" >/dev/null 2>&1 || return
+  home=$(mktemp -d)
+  md="$home/CLAUDE.md"
+  printf '# My rules\n\nkeep this line.\n' > "$md"
+  # Three installs must leave exactly one block and preserve the original line.
+  ( cd "$home" && env -i HOME="$home" PATH="$PATH" "$sh_bin" "$ROOT/scripts/focus-setup.sh" local >/dev/null 2>&1 )
+  ( cd "$home" && env -i HOME="$home" PATH="$PATH" "$sh_bin" "$ROOT/scripts/focus-setup.sh" local >/dev/null 2>&1 )
+  ( cd "$home" && env -i HOME="$home" PATH="$PATH" "$sh_bin" "$ROOT/scripts/focus-setup.sh" local >/dev/null 2>&1 )
+  n=$(grep -c 'FOCUS-LEDGER:BEGIN' "$md")
+  kept=$(grep -c 'keep this line' "$md")
+  if [ "$n" = 1 ] && [ "$kept" = 1 ]; then
+    pass=$((pass+1)); printf '  ok   [%s] setup: idempotent single block, preserves content\n' "$sh_bin"
+  else fail=$((fail+1)); printf '  FAIL [%s] setup: blocks=%s kept=%s (want 1/1)\n' "$sh_bin" "$n" "$kept"; fi
+  # Remove must drop the block but keep the original line.
+  ( cd "$home" && env -i HOME="$home" PATH="$PATH" "$sh_bin" "$ROOT/scripts/focus-setup.sh" local --remove >/dev/null 2>&1 )
+  n2=$(grep -c 'FOCUS-LEDGER:BEGIN' "$md")
+  kept2=$(grep -c 'keep this line' "$md")
+  if [ "$n2" = 0 ] && [ "$kept2" = 1 ]; then
+    pass=$((pass+1)); printf '  ok   [%s] setup: --remove clears block, keeps content\n' "$sh_bin"
+  else fail=$((fail+1)); printf '  FAIL [%s] setup: after remove blocks=%s kept=%s (want 0/1)\n' "$sh_bin" "$n2" "$kept2"; fi
+  rm -rf "$home"
+}
+
 main() {
   shells=${1:-}
   if [ -n "$shells" ]; then set -- "$shells"; else set -- bash dash; fi
@@ -93,6 +119,7 @@ main() {
     run_suite "$s"
     run_injection_check "$s"
     run_park_check "$s"
+    run_setup_check "$s"
   done
   echo
   echo "TOTAL: $pass passed, $fail failed"

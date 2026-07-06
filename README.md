@@ -8,6 +8,7 @@ A cross-session task ledger for Claude Code, with soft nudges. Park open threads
 - **`/focus-ledger:park <thing>`** — create a new durable thread that survives across sessions.
 - **`/focus-ledger:resume <thing>`** — reactivate an already-parked thread into the active session.
 - **`/focus-ledger:snooze [1d|4h|30m]`** — mute the stale-thread nudge for a while.
+- **`/focus-ledger:setup [local|global|remove]`** — install the one behavior that can't be a hook: offer to park the old thread when you pivot to a new topic (see below). Writes a managed block to your `CLAUDE.md`; re-run to update, `remove` to take it out.
 
 You can also just say it in plain English — the commands are trigger-described, so they fire without the slash prefix too:
 
@@ -77,9 +78,15 @@ claude --plugin-dir ./focus-ledger
 
 ## Optional: offer to park when you change direction
 
-The commands and hooks cover the *manual* and *event-driven* parts. There's one more behavior some people want — **when you pivot off an unfinished thread to a new topic, have the assistant offer to park the old one** — that can't be a hook (it needs the model's judgment about what "pivoting off something unfinished" means), so it lives as an instruction you opt into.
+The commands and hooks cover the *manual* and *event-driven* parts. There's one more behavior some people want — **when you pivot off an unfinished thread to a new topic, have the assistant offer to park the old one** — that can't be a hook (it needs the model's judgment about what "pivoting off something unfinished" means), so it lives as an instruction in your `CLAUDE.md` rather than in plugin code.
 
-If you want it, add this to your `~/.claude/CLAUDE.md`:
+It's off by default, because it changes how the assistant talks to you in *every* conversation, and that's a matter of taste. Turn it on when you want it:
+
+```
+/focus-ledger:setup local     # this project's CLAUDE.md (or: global, for every project)
+```
+
+That writes a managed, clearly-marked block to your `CLAUDE.md` (backing the file up first). Re-run to update it in place, or `/focus-ledger:setup remove` to take it back out. The block it writes:
 
 ```markdown
 When I pivot off an unfinished thread to a new topic, answer the new thing and
@@ -88,14 +95,14 @@ Offer, don't auto-park. One line, not a paragraph. Only on a real pivot off
 something unfinished — not every topic change.
 ```
 
-It's off by default and not part of the plugin, because it's a matter of taste and it changes how the assistant talks to you in every conversation. Add it only if that suits how you work.
+Prefer to paste it yourself? That works too — the command just does it idempotently so you don't end up with duplicates when the wording changes.
 
 ## What runs, and what it can touch
 
 The three hooks run automatically on session events, so here's the trust ask in full:
 
 - **No network, ever** — only local file reads and text output. The scripts in `hooks/` and `scripts/` are short; read them.
-- **Writes only under `~/.claude/`** — the ledger, a `.focus-snooze` marker, and a transient lock file during `park`.
+- **Writes only under `~/.claude/`** — the ledger, a `.focus-snooze` marker, and a transient lock file during `park`. The one exception is `/focus-ledger:setup`, which you run explicitly: it edits a `CLAUDE.md` (project-local or `~/.claude/`) and backs it up first.
 - **Ledger text is never executed** — the hooks parse it as data, never as shell.
 - **SessionStart puts your parked items into the model's context** (so the session opens aware of them) — which means, like anything in a conversation, that text goes to your model provider. Don't park secrets.
 - **Every hook is soft** — it adds a note or context, never blocks. Turn any off with the env vars above.

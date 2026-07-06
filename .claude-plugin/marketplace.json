@@ -8,7 +8,7 @@
       "name": "focus-ledger",
       "source": "./",
       "description": "A cross-session task ledger with soft nudges. Parks open threads that survive restarts, replays them when you open a session, and quietly flags stale ones.",
-      "version": "1.0.0"
+      "version": "1.1.0"
     }
   ]
 }

@@ -4,6 +4,17 @@ All notable changes to focus-ledger are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/); this project uses
 [semantic versioning](https://semver.org/).
 
+## [1.1.0] — 2026-07-06
+
+### Added
+- **`focus` `setup` command** and `scripts/focus-setup.sh`: installs the one
+  behavior that can't be a hook — "offer to park the old thread when you pivot" —
+  as a managed, idempotent block in `CLAUDE.md` (local or global), with a backup
+  and a clean `--remove`. Replaces the old hand-paste instruction, which stays
+  documented as a fallback. Pure shell + `awk`, no new dependency.
+- `SECURITY.md` with a private disclosure channel and a plain statement of what
+  the plugin can and can't touch.
+
 ## [1.0.0] — 2026-07-06
 
 Initial release.
