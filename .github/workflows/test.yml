@@ -1,18 +1,23 @@
 name: test
 on: [push, pull_request]
 jobs:
-  test:
+  shellcheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ludeeus/action-shellcheck@master
+        with:
+          scandir: '.'
+          # Match the severity used locally; fail only on real issues, not style nits.
+          severity: warning
+
+  suite:
     strategy:
+      fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
-      - name: shellcheck
-        run: |
-          if ! command -v shellcheck >/dev/null; then
-            sudo apt-get update && sudo apt-get install -y shellcheck || brew install shellcheck
-          fi
-          shellcheck hooks/*.sh scripts/*.sh test/*.sh
       - name: run suite (bash + dash)
         run: bash test/run.sh

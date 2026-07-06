@@ -68,6 +68,11 @@ while [ "$i" -lt 20 ]; do
   i=$((i+1))
 done
 _do_park
-[ -n "$locked" ] && rmdir "$LOCK" 2>/dev/null || true
+# Release the lock if we took it (best-effort; ignore any error). Written as a real
+# if/then rather than `A && B || C`, which shellcheck flags (SC2015) and which would
+# also run the fallback when the test fails, not only when B fails.
+if [ -n "$locked" ]; then
+  rmdir "$LOCK" 2>/dev/null || true
+fi
 
 printf '%s\n' "$thing"
