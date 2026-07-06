@@ -1,0 +1,18 @@
+name: test
+on: [push, pull_request]
+jobs:
+  test:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: shellcheck
+        run: |
+          if ! command -v shellcheck >/dev/null; then
+            sudo apt-get update && sudo apt-get install -y shellcheck || brew install shellcheck
+          fi
+          shellcheck hooks/*.sh scripts/*.sh test/*.sh
+      - name: run suite (bash + dash)
+        run: bash test/run.sh

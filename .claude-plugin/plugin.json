@@ -1,0 +1,10 @@
+{
+  "name": "focus-ledger",
+  "description": "A cross-session task ledger with soft nudges. Parks open threads that survive restarts, replays them when you open a session, and quietly flags stale ones. For anyone who juggles many loops and wants the tool to hold state instead of relying on memory.",
+  "version": "1.0.0",
+  "author": {
+    "name": "dsdsteve"
+  },
+  "license": "MIT",
+  "keywords": ["productivity", "tasks", "focus", "ledger", "adhd"]
+}
