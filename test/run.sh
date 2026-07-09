@@ -10,6 +10,7 @@ set -u
 HERE=$(cd "$(dirname "$0")" && pwd)
 ROOT=$(cd "$HERE/.." && pwd)
 FIX="$HERE/fixtures"
+TODAY=$(date +%F)   # fixtures use @TODAY@ so "fresh" items never rot into stale
 pass=0; fail=0
 
 # Each case runs in an isolated fake HOME with a chosen ledger fixture (or none).
@@ -19,7 +20,7 @@ run_case() {
   sh_bin=$1; name=$2; fixture=$3; exp_rc=$4; exp_clean=$5; hook=$6; want=$7; notwant=$8; shift 8
   home=$(mktemp -d)
   mkdir -p "$home/.claude"
-  [ "$fixture" = EMPTY ] || cp "$FIX/$fixture" "$home/.claude/focus-ledger.md"
+  [ "$fixture" = EMPTY ] || sed "s/@TODAY@/$TODAY/" "$FIX/$fixture" > "$home/.claude/focus-ledger.md"
   out=$(env -i HOME="$home" PATH="$PATH" "$@" "$sh_bin" "$ROOT/$hook" 2>"$home/err"); rc=$?
   err=$(cat "$home/err")
   ok=1; why=""
@@ -42,11 +43,14 @@ run_suite() {
   run_case "$sh_bin" "session-start: empty ledger -> silent, rc0"   empty.md     0 1 hooks/focus-session-start.sh "" ""
   run_case "$sh_bin" "session-start: populated -> frames untrusted" populated.md 0 1 hooks/focus-session-start.sh "untrusted" ""
   run_case "$sh_bin" "session-start: populated -> lists the item"   populated.md 0 1 hooks/focus-session-start.sh "recent parked item" ""
+  run_case "$sh_bin" "session-start: <!-- --> examples skipped"     commented.md 0 1 hooks/focus-session-start.sh "real fresh item" "commented example"
 
   # Stop: silent when nothing stale; flags stale; skips malformed/undated; off-switch.
   run_case "$sh_bin" "stop: no ledger -> silent, rc0"               EMPTY        0 1 hooks/focus-stop.sh "" ""
   run_case "$sh_bin" "stop: fresh only -> silent"                   populated.md 0 1 hooks/focus-stop.sh "" "recent parked item"
   run_case "$sh_bin" "stop: stale -> flags old item"                stale.md     0 1 hooks/focus-stop.sh "very old item" ""
+  run_case "$sh_bin" "stop: two stale -> '; ' separated"            stale.md     0 1 hooks/focus-stop.sh "very old item; second old item" ""
+  run_case "$sh_bin" "stop: <!-- --> stale example -> silent"       commented.md 0 1 hooks/focus-stop.sh "" "commented example"
   run_case "$sh_bin" "stop: future date -> not flagged"             stale.md     0 1 hooks/focus-stop.sh "" "far future item"
   run_case "$sh_bin" "stop: malformed date -> skipped, silent"      malformed.md 0 1 hooks/focus-stop.sh "" "impossible date"
   run_case "$sh_bin" "stop: FOCUS_STOP_NUDGE=off -> silent"         stale.md     0 1 hooks/focus-stop.sh "" "very old item" FOCUS_STOP_NUDGE=off
@@ -83,6 +87,19 @@ run_park_check() {
   if printf '%s' "$led" | grep -qF "recent parked item" && printf '%s' "$led" | grep -qF "newly parked"; then
     pass=$((pass+1)); printf '  ok   [%s] park: appends and preserves existing item\n' "$sh_bin"
   else fail=$((fail+1)); printf '  FAIL [%s] park: lost an item\n' "$sh_bin"; fi
+
+  # Backslashes in item text stay literal on one line (awk -v would eat \n).
+  env -i HOME="$home" PATH="$PATH" "$sh_bin" "$ROOT/scripts/focus-park.sh" 'fix the \n handling' >/dev/null 2>&1
+  if grep -qF 'fix the \n handling' "$home/.claude/focus-ledger.md"; then
+    pass=$((pass+1)); printf '  ok   [%s] park: backslash item stays literal, one line\n' "$sh_bin"
+  else fail=$((fail+1)); printf '  FAIL [%s] park: backslash item mangled\n' "$sh_bin"; fi
+
+  # A stale lock left by a dead park must be reaped, not waited on forever.
+  mkdir "$home/.claude/focus-ledger.md.lock"
+  env -i HOME="$home" PATH="$PATH" "$sh_bin" "$ROOT/scripts/focus-park.sh" "after stale lock" >/dev/null 2>&1
+  if grep -qF "after stale lock" "$home/.claude/focus-ledger.md" && [ ! -d "$home/.claude/focus-ledger.md.lock" ]; then
+    pass=$((pass+1)); printf '  ok   [%s] park: reaps stale lock and proceeds\n' "$sh_bin"
+  else fail=$((fail+1)); printf '  FAIL [%s] park: stale lock not reaped\n' "$sh_bin"; fi
   rm -rf "$home"
 }
 
@@ -102,6 +119,11 @@ run_setup_check() {
   if [ "$n" = 1 ] && [ "$kept" = 1 ]; then
     pass=$((pass+1)); printf '  ok   [%s] setup: idempotent single block, preserves content\n' "$sh_bin"
   else fail=$((fail+1)); printf '  FAIL [%s] setup: blocks=%s kept=%s (want 1/1)\n' "$sh_bin" "$n" "$kept"; fi
+  # Repeated runs keep only the latest backup, not one per run.
+  nbak=$(ls "$md".focus-bak.* 2>/dev/null | wc -l | tr -d ' ')
+  if [ "$nbak" = 1 ]; then
+    pass=$((pass+1)); printf '  ok   [%s] setup: single backup kept across runs\n' "$sh_bin"
+  else fail=$((fail+1)); printf '  FAIL [%s] setup: %s backups (want 1)\n' "$sh_bin" "$nbak"; fi
   # Remove must drop the block but keep the original line.
   ( cd "$home" && env -i HOME="$home" PATH="$PATH" "$sh_bin" "$ROOT/scripts/focus-setup.sh" local --remove >/dev/null 2>&1 )
   n2=$(grep -c 'FOCUS-LEDGER:BEGIN' "$md")

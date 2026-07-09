@@ -8,7 +8,10 @@ LEDGER="$HOME/.claude/focus-ledger.md"
 [ -f "$LEDGER" ] || exit 0
 
 # Open items ("- [ ]") in the "## Parked" section, up to the next "## " heading.
+# Lines inside <!-- --> blocks are format examples, not items (format v1) — skip.
 parked=$(awk '
+  incom { if (index($0, "-->")) incom=0; next }
+  index($0, "<!--") == 1 { if (!index($0, "-->")) incom=1; next }
   /^## Parked/      {inpk=1; next}
   /^## /            {inpk=0}
   inpk && /^- \[ \]/ {print}

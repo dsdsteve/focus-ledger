@@ -4,6 +4,27 @@ All notable changes to focus-ledger are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/); this project uses
 [semantic versioning](https://semver.org/).
 
+## [1.1.1] — 2026-07-09
+
+### Fixed
+- Stop hook: two or more stale items now join with `; ` as intended —
+  `paste -sd '; '` treats `'; '` as a cycling delimiter *list* (`a;b c`),
+  so the join is done in `awk` instead.
+- Park: item text containing backslashes (e.g. a literal `\n`) is no longer
+  mangled — the item reaches `awk` via `ENVIRON` instead of `-v`, which
+  interprets escape sequences and would split the line.
+- Hooks now skip `- [ ]` lines inside `<!-- -->` comment blocks, matching what
+  the `focus` command already documented: commented format examples are no
+  longer replayed at SessionStart or flagged stale by the Stop hook.
+- Park: a stale lock left by a killed park is reaped after the wait window,
+  instead of costing every future park the full 2s timeout forever.
+- Setup: repeated runs keep only the latest `CLAUDE.md.focus-bak.*` backup
+  instead of accumulating one per run in the project root.
+
+### Changed
+- Test fixtures use an `@TODAY@` placeholder (substituted at run time) so
+  "fresh" items can't rot into stale as calendar time passes.
+
 ## [1.1.0] — 2026-07-06
 
 ### Added

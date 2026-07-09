@@ -32,6 +32,9 @@ today_days=$(( now / 86400 ))   # whole days since epoch, UTC
 # both safe (no ledger text ever reaches a shell) and portable (works on BSD awk,
 # which lacks mktime()). Only the strict 4-2-2 digit groups are read.
 stale=$(awk -v today="$today_days" -v thr="$threshold" '
+  # Lines inside <!-- --> blocks are format examples, not items (format v1) — skip.
+  incom { if (index($0, "-->")) incom=0; next }
+  index($0, "<!--") == 1 { if (!index($0, "-->")) incom=1; next }
   function days(y,m,d,   era,yoe,doy,doe){
     if (m <= 2) { y--; m += 12 }
     era = int((y>=0?y:y-399)/400); yoe = y - era*400
@@ -56,9 +59,10 @@ stale=$(awk -v today="$today_days" -v thr="$threshold" '
 
 [ -z "$stale" ] && exit 0
 
-# Compact message: up to 3 items, then "+N more".
+# Compact message: up to 3 items, then "+N more". Joined in awk — paste -sd '; '
+# treats '; ' as a cycling delimiter LIST (a;b c), not a two-char separator.
 n=$(printf '%s\n' "$stale" | grep -c .)
-head3=$(printf '%s\n' "$stale" | head -3 | paste -sd '; ' -)
+head3=$(printf '%s\n' "$stale" | head -3 | awk 'NR>1{printf "; "} {printf "%s", $0}')
 if [ "$n" -gt 3 ]; then head3="$head3; +$((n-3)) more"; fi
 
 msg="Open a while: $head3. Run /focus-ledger:focus to view, or /focus-ledger:snooze to hide. (Only shows when something's been sitting past $threshold days.)"

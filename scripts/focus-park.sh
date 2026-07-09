@@ -37,7 +37,10 @@ _do_park() {
     # Insert as the last line of the Parked block: emit the new item right before the
     # trailing blank line(s) that precede "## This session", so the section stays tight
     # (no accumulating blank lines) and existing items are byte-for-byte untouched.
-    awk -v item="$item" -v ph="$PARKED_HEAD" -v sh="$SESSION_HEAD" '
+    # Item and headings ride in via ENVIRON, not -v: awk -v interprets backslash
+    # escapes, so parking text with a literal \n would split into two lines.
+    ITEM="$item" PH="$PARKED_HEAD" SH="$SESSION_HEAD" awk '
+      BEGIN { item=ENVIRON["ITEM"]; ph=ENVIRON["PH"]; sh=ENVIRON["SH"] }
       $0 == ph { inpk=1 }
       inpk && $0 == sh && !done {
         # peel back any blank lines we already buffered, print item, then restore them
@@ -67,6 +70,11 @@ while [ "$i" -lt 20 ]; do
   sleep 0.1
   i=$((i+1))
 done
+# Waited out the whole window: the holder is presumed dead (a park killed between
+# mkdir and rmdir). Reap the stale lock so future parks don't also eat the full wait.
+if [ -z "$locked" ]; then
+  rmdir "$LOCK" 2>/dev/null || true
+fi
 _do_park
 # Release the lock if we took it (best-effort; ignore any error). Written as a real
 # if/then rather than `A && B || C`, which shellcheck flags (SC2015) and which would

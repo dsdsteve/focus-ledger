@@ -32,6 +32,9 @@ esac
 
 mkdir -p "$(dirname "$CLAUDE_MD")"
 touch "$CLAUDE_MD"
+# Keep only the latest backup — repeated runs would otherwise pile up
+# CLAUDE.md.focus-bak.* files in the project root (easy to commit by accident).
+rm -f "$CLAUDE_MD".focus-bak.* 2>/dev/null || true
 cp "$CLAUDE_MD" "$CLAUDE_MD.focus-bak.$(date +%s)"
 
 # Strip any existing FOCUS-LEDGER block, then drop trailing blank lines. Buffering
