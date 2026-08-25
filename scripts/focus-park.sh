@@ -8,6 +8,12 @@
 # Inserts `- [ ] (YYYY-MM-DD) <thing>` at the END of the "## Parked" section (before
 # the "## This session" heading), creating the ledger with both sections if absent.
 # Prints the one-line item text on success.
+#
+# On-disk artifacts beside the ledger (transient; both removed on normal exit and by
+# the signal trap): `focus-ledger.md.lock` (the mutex dir) and
+# `focus-ledger.md.lock.reap` (the reap-serialization token, see below). A crash can
+# strand them; a stranded lock is reaped automatically, a stranded reap token only
+# degrades parks to append-at-EOF (never loses items) until removed by hand.
 set -eu
 
 # Fixed path so the scripts and the /focus, /resume, /snooze command prompts (which
@@ -30,6 +36,17 @@ mkdir -p "$(dirname "$LEDGER")"
 # interleave with nothing and overwrite nothing. The item may land at EOF instead of
 # inside the Parked section (a later tidy verb can re-home it), but it is never lost.
 _append_park() {
+  if [ ! -f "$LEDGER" ]; then
+    # First-ever park landing here (e.g. lock unacquirable) still writes the
+    # skeleton, so later parks keep using the structured insert instead of
+    # degrading to plain appends forever.
+    printf '# Focus ledger\n\n%s\n\n%s\n' "$PARKED_HEAD" "$SESSION_HEAD" >> "$LEDGER"
+  elif [ -s "$LEDGER" ] && [ -n "$(tail -c 1 "$LEDGER")" ]; then
+    # Hand-edited ledger without a final newline: appending would glue the item
+    # onto the last line, corrupting both and hiding the item from the
+    # line-anchored hook parsers. Restore the newline first.
+    printf '\n' >> "$LEDGER"
+  fi
   printf '%s\n' "$item" >> "$LEDGER"
 }
 
@@ -40,36 +57,60 @@ _do_park() {
   fi
   # Insert the item as the last line of the Parked section. If either heading is
   # missing (hand-edited ledger), fall back to a plain append so nothing is lost.
+  # NOTE: the grep gate is a substring match but the awk below matches whole lines;
+  # a near-miss heading (extra text, trailing space) passes the gate and inserts
+  # nothing — the awk exits nonzero for that (exit !done) so we degrade to the
+  # append instead of installing a rewrite that silently dropped the item.
   if grep -qF "$PARKED_HEAD" "$LEDGER" && grep -qF "$SESSION_HEAD" "$LEDGER"; then
-    # Rewrite through a per-process temp file in the ledger's own directory: mktemp
-    # keeps concurrent parks off each other's output (the old fixed ".tmp" name was
-    # a collision), and staying in the same directory keeps the mv an atomic
-    # same-filesystem rename. On any failure, remove the temp and degrade to the
-    # append so the item is never lost and no litter remains.
-    tmp=$(mktemp "$LEDGER.XXXXXX" 2>/dev/null) || { _append_park; return; }
-    # Insert as the last line of the Parked block: emit the new item right before the
-    # trailing blank line(s) that precede "## This session", so the section stays tight
-    # (no accumulating blank lines) and existing items are byte-for-byte untouched.
-    # Item and headings ride in via ENVIRON, not -v: awk -v interprets backslash
-    # escapes, so parking text with a literal \n would split into two lines.
-    if ITEM="$item" PH="$PARKED_HEAD" SH="$SESSION_HEAD" awk '
-      BEGIN { item=ENVIRON["ITEM"]; ph=ENVIRON["PH"]; sh=ENVIRON["SH"] }
-      $0 == ph { inpk=1 }
-      inpk && $0 == sh && !done {
-        # peel back any blank lines we already buffered, print item, then restore them
-        print item
-        for (k=1; k<=nb; k++) print ""
-        nb=0; inpk=0; done=1; print; next
-      }
-      inpk && $0 == "" { nb++; next }        # buffer blank lines inside Parked
-      { for (k=1; k<=nb; k++) print ""; nb=0; print }
-      END { for (k=1; k<=nb; k++) print "" }
-    ' "$LEDGER" > "$tmp"; then
-      mv "$tmp" "$LEDGER" || { rm -f "$tmp"; _append_park; }
-    else
-      rm -f "$tmp"
-      _append_park
-    fi
+    tries=0
+    while [ "$tries" -lt 2 ]; do
+      tries=$((tries+1))
+      pre_bytes=$(wc -c < "$LEDGER")
+      pre_lines=$(wc -l < "$LEDGER")
+      # Rewrite through a per-process temp file in the ledger's own directory:
+      # mktemp keeps concurrent parks off each other's output (the old fixed
+      # ".tmp" name was a collision), and staying in the same directory keeps
+      # the mv an atomic same-filesystem rename. On any failure, remove the
+      # temp and degrade to the append so the item is never lost.
+      tmp=$(mktemp "$LEDGER.XXXXXX" 2>/dev/null) || { _append_park; return; }
+      # Insert as the last line of the Parked block: emit the new item right before
+      # the trailing blank line(s) that precede "## This session", so the section
+      # stays tight and existing items are byte-for-byte untouched. Item and
+      # headings ride in via ENVIRON, not -v: awk -v interprets backslash escapes,
+      # so parking text with a literal \n would split into two lines. The END exit
+      # reports whether the insert actually happened.
+      if ! ITEM="$item" PH="$PARKED_HEAD" SH="$SESSION_HEAD" awk '
+        BEGIN { item=ENVIRON["ITEM"]; ph=ENVIRON["PH"]; sh=ENVIRON["SH"] }
+        $0 == ph { inpk=1 }
+        inpk && $0 == sh && !done {
+          # peel back any blank lines we already buffered, print item, then restore them
+          print item
+          for (k=1; k<=nb; k++) print ""
+          nb=0; inpk=0; done=1; print; next
+        }
+        inpk && $0 == "" { nb++; next }        # buffer blank lines inside Parked
+        { for (k=1; k<=nb; k++) print ""; nb=0; print }
+        END { for (k=1; k<=nb; k++) print ""; exit !done }
+      ' "$LEDGER" > "$tmp"; then
+        rm -f "$tmp"; _append_park; return
+      fi
+      # Truncation guard: an insert must yield MORE lines than the source had.
+      # Some awks exit 0 on a failed/short write (e.g. disk full); never let a
+      # truncated temp replace the ledger and destroy existing items.
+      if [ "$(wc -l < "$tmp")" -le "$pre_lines" ]; then
+        rm -f "$tmp"; _append_park; return
+      fi
+      # Lost-append guard: a lockless append (another park's last resort) may have
+      # landed while we rewrote. Publishing our temp would erase it, so re-derive
+      # once from the new contents; if the file moves again, take the append path
+      # ourselves rather than risk anyone's item.
+      if [ "$(wc -c < "$LEDGER")" -ne "$pre_bytes" ]; then
+        rm -f "$tmp"; continue
+      fi
+      if mv "$tmp" "$LEDGER"; then return; fi
+      rm -f "$tmp"; _append_park; return
+    done
+    _append_park
   else
     _append_park
   fi
@@ -84,10 +125,22 @@ _do_park() {
 # above takes over — a misplaced item is acceptable, a lost one is not.
 # ponytail: mkdir-lock with a bounded ~2s+1s wait — fine for a single-user tool; if
 # you ever drive it from many concurrent sessions, move to a real lock daemon.
+# NOTE: the wait windows (20 and 10 tries at 0.1s) are load-bearing for the timing
+# in test/run.sh's contention cases — retune both together.
 LOCK="$LEDGER.lock"
 REAP="$LOCK.reap"
 locked=""
 reaping=""
+tmp=""
+
+# A signal mid-park must not strand the mutex, the reap token, or a temp file:
+# a stranded reap token would silently disable reaping for every future park.
+_cleanup() {
+  if [ -n "${tmp:-}" ]; then rm -f "$tmp" 2>/dev/null || true; fi
+  if [ -n "$locked" ]; then rmdir "$LOCK" 2>/dev/null || true; fi
+  if [ -n "$reaping" ]; then rmdir "$REAP" 2>/dev/null || true; fi
+}
+trap '_cleanup; exit 1' INT TERM HUP
 
 # Bounded lock attempt: poll mkdir every 0.1s for $1 tries; locked=1 on success.
 _try_lock() {

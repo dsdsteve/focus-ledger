@@ -103,8 +103,12 @@ run_park_check() {
 
   # Regression (story 1.1): a lock held past every wait window while two parks race.
   # Both time out together, reap, and must serialize — afterwards both new items AND
-  # the pre-existing one are present (possibly EOF-appended), and nothing is left
-  # behind: no lock, no reap token, no mktemp litter (anything focus-ledger.md.*).
+  # the pre-existing one are present, both parks exit 0, at least one raced item sits
+  # INSIDE the Parked section (proving reap + re-acquire + rewrite actually ran, not
+  # just the append fallback), and nothing is left behind: no lock, no reap token, no
+  # mktemp litter (anything focus-ledger.md.*).
+  # Timing is coupled to the script's wait windows (20+10 tries at 0.1s ≈ 2s+1s):
+  # the holder's 3s must outlast the primary window; retune them together.
   lockdir="$home/.claude/focus-ledger.md.lock"
   mkdir "$lockdir"
   ( sleep 3; rmdir "$lockdir" 2>/dev/null ) &
@@ -113,13 +117,19 @@ run_park_check() {
   ra=$!
   env -i HOME="$home" PATH="$PATH" "$sh_bin" "$ROOT/scripts/focus-park.sh" "race item bravo" >/dev/null 2>&1 &
   rb=$!
-  wait "$ra" "$rb"
+  wait "$ra"; rca=$?
+  wait "$rb"; rcb=$?
   wait "$holder"
   led=$(cat "$home/.claude/focus-ledger.md")
   ok=1; why=""
   for want in "race item alpha" "race item bravo" "recent parked item"; do
     printf '%s' "$led" | grep -qF "$want" || { ok=0; why="$why; missing '$want'"; }
   done
+  [ "$rca" = 0 ] || { ok=0; why="$why; alpha rc=$rca"; }
+  [ "$rcb" = 0 ] || { ok=0; why="$why; bravo rc=$rcb"; }
+  if ! awk '/^## This session/{exit} /race item (alpha|bravo)/{found=1} END{exit !found}' "$home/.claude/focus-ledger.md"; then
+    ok=0; why="$why; no raced item inside Parked"
+  fi
   set -- "$home/.claude/focus-ledger.md."*
   if [ -e "$1" ]; then ok=0; why="$why; leftover: $*"; fi
   if [ "$ok" = 1 ]; then pass=$((pass+1)); printf '  ok   [%s] park: race on held lock keeps every item, no litter\n' "$sh_bin"
@@ -154,6 +164,61 @@ run_park_check() {
   if [ "$rc" = 2 ] && grep -q "nothing to park" "$home/err2" && [ "$before" = "$after" ]; then
     pass=$((pass+1)); printf '  ok   [%s] park: empty argument -> rc 2, ledger untouched\n' "$sh_bin"
   else fail=$((fail+1)); printf '  FAIL [%s] park: empty argument (rc=%s)\n' "$sh_bin" "$rc"; fi
+
+  # Rewrite-failure fallback: awk dying mid-rewrite must degrade to the append —
+  # item kept, rc 0, stdout intact, no temp litter. (Stub awk shadows the real
+  # one through PATH; every other tool the script uses stays real.)
+  stub=$(mktemp -d)
+  printf '#!/bin/sh\nexit 1\n' > "$stub/awk"; chmod +x "$stub/awk"
+  out=$(env -i HOME="$home" PATH="$stub:$PATH" "$sh_bin" "$ROOT/scripts/focus-park.sh" "awk failed item" 2>/dev/null); rc=$?
+  set -- "$home/.claude/focus-ledger.md."*
+  if [ "$rc" = 0 ] && [ "$out" = "awk failed item" ] && grep -qF "awk failed item" "$home/.claude/focus-ledger.md" && [ ! -e "$1" ]; then
+    pass=$((pass+1)); printf '  ok   [%s] park: awk failure -> append fallback, no litter\n' "$sh_bin"
+  else fail=$((fail+1)); printf '  FAIL [%s] park: awk failure fallback (rc=%s)\n' "$sh_bin" "$rc"; fi
+
+  # Truncation guard: an awk that exits 0 but writes nothing (short-write/ENOSPC
+  # shape) must NOT have its empty temp installed over the ledger — existing items
+  # survive and the new item degrades to the append.
+  printf '#!/bin/sh\nexit 0\n' > "$stub/awk"
+  env -i HOME="$home" PATH="$stub:$PATH" "$sh_bin" "$ROOT/scripts/focus-park.sh" "silent truncation item" >/dev/null 2>&1; rc=$?
+  set -- "$home/.claude/focus-ledger.md."*
+  if [ "$rc" = 0 ] && grep -qF "silent truncation item" "$home/.claude/focus-ledger.md" && grep -qF "recent parked item" "$home/.claude/focus-ledger.md" && [ ! -e "$1" ]; then
+    pass=$((pass+1)); printf '  ok   [%s] park: truncated rewrite blocked, ledger preserved\n' "$sh_bin"
+  else fail=$((fail+1)); printf '  FAIL [%s] park: truncation guard (rc=%s)\n' "$sh_bin" "$rc"; fi
+  rm -rf "$stub"
+
+  # Near-miss heading (trailing space): the substring grep gate passes but the
+  # exact-match awk cannot insert — the park must detect the non-insert and
+  # degrade to the append instead of installing a rewrite missing the item.
+  printf '# Focus ledger\n\n## Parked (durable — carries across sessions) \n- [ ] (2026-01-01) preexisting near item\n\n## This session (volatile — clear whenever)\n' > "$home/.claude/focus-ledger.md"
+  out=$(env -i HOME="$home" PATH="$PATH" "$sh_bin" "$ROOT/scripts/focus-park.sh" "near miss heading item" 2>/dev/null); rc=$?
+  if [ "$rc" = 0 ] && grep -qF "near miss heading item" "$home/.claude/focus-ledger.md" && grep -qF "preexisting near item" "$home/.claude/focus-ledger.md"; then
+    pass=$((pass+1)); printf '  ok   [%s] park: near-miss heading -> append, item never dropped\n' "$sh_bin"
+  else fail=$((fail+1)); printf '  FAIL [%s] park: near-miss heading (rc=%s)\n' "$sh_bin" "$rc"; fi
+
+  # Append onto a ledger with no final newline (hand-edit): the guard must restore
+  # the newline so the old last line and the new item stay separate lines.
+  printf '## Parked (durable — carries across sessions)\n- [ ] (2026-01-01) tail item' > "$home/.claude/focus-ledger.md"
+  env -i HOME="$home" PATH="$PATH" "$sh_bin" "$ROOT/scripts/focus-park.sh" "newline guard item" >/dev/null 2>&1
+  if grep -q '^- \[ \] (2026-01-01) tail item$' "$home/.claude/focus-ledger.md" && grep -q '^- \[ \] (....-..-..) newline guard item$' "$home/.claude/focus-ledger.md"; then
+    pass=$((pass+1)); printf '  ok   [%s] park: no-final-newline ledger -> lines kept separate\n' "$sh_bin"
+  else fail=$((fail+1)); printf '  FAIL [%s] park: no-final-newline append glued lines\n' "$sh_bin"; fi
+
+  # First-ever park under an unacquirable lock must still create the section
+  # skeleton, so later (unlocked) parks return to the structured insert instead
+  # of degrading to plain appends forever.
+  rm -f "$home/.claude/focus-ledger.md"
+  mkdir "$home/.claude/focus-ledger.md.lock" "$home/.claude/focus-ledger.md.lock.reap"
+  env -i HOME="$home" PATH="$PATH" "$sh_bin" "$ROOT/scripts/focus-park.sh" "skeleton first item" >/dev/null 2>&1
+  rmdir "$home/.claude/focus-ledger.md.lock" "$home/.claude/focus-ledger.md.lock.reap"
+  env -i HOME="$home" PATH="$PATH" "$sh_bin" "$ROOT/scripts/focus-park.sh" "structured second item" >/dev/null 2>&1
+  ok=1
+  grep -qF "## Parked" "$home/.claude/focus-ledger.md" || ok=0
+  grep -qF "skeleton first item" "$home/.claude/focus-ledger.md" || ok=0
+  awk '/^## This session/{exit} /structured second item/{found=1} END{exit !found}' "$home/.claude/focus-ledger.md" || ok=0
+  if [ "$ok" = 1 ]; then
+    pass=$((pass+1)); printf '  ok   [%s] park: lockless first park writes skeleton, next park structured\n' "$sh_bin"
+  else fail=$((fail+1)); printf '  FAIL [%s] park: lockless first park left ledger headingless\n' "$sh_bin"; fi
   rm -rf "$home"
 }
 
