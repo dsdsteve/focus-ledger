@@ -281,7 +281,7 @@ run_park_check() {
 # byte-identical (cksum — "$(cat)" would eat trailing-newline differences), no
 # backup created or rotated, and a recovery hint on stderr.
 run_setup_guard_case() {
-  gname=$1; gmode=$2; gcontent=$3
+  gname=$1; gmode=$2; gcontent=$3; greason=$4
   ghome=$(mktemp -d)
   gmd="$ghome/CLAUDE.md"
   printf '%s\n' "$gcontent" > "$gmd"
@@ -293,13 +293,14 @@ run_setup_guard_case() {
   fi
   gafter=$(cksum < "$gmd")
   gnbak=$(ls "$gmd".focus-bak.* 2>/dev/null | wc -l | tr -d ' ')
-  ok=1; why=""
-  [ "$grc" = 3 ] || { ok=0; why="rc=$grc want 3"; }
-  [ "$gbefore" = "$gafter" ] || { ok=0; why="$why; file changed"; }
-  [ "$gnbak" = 0 ] || { ok=0; why="$why; $gnbak backups (want 0)"; }
-  grep -q "recover" "$ghome/gerr" || { ok=0; why="$why; no recovery hint on stderr"; }
-  if [ "$ok" = 1 ]; then pass=$((pass+1)); printf '  ok   [%s] setup: %s\n' "$sh_bin" "$gname"
-  else fail=$((fail+1)); printf '  FAIL [%s] setup: %s -- %s\n' "$sh_bin" "$gname" "$why"; fi
+  gok=1; gwhy=""
+  [ "$grc" = 3 ] || { gok=0; gwhy="$gwhy rc=$grc want 3;"; }
+  [ "$gbefore" = "$gafter" ] || { gok=0; gwhy="$gwhy file changed;"; }
+  [ "$gnbak" = 0 ] || { gok=0; gwhy="$gwhy $gnbak backups (want 0);"; }
+  grep -q "recover" "$ghome/gerr" || { gok=0; gwhy="$gwhy no recovery hint on stderr;"; }
+  grep -qF "$greason" "$ghome/gerr" || { gok=0; gwhy="$gwhy diagnostic missing '$greason';"; }
+  if [ "$gok" = 1 ]; then pass=$((pass+1)); printf '  ok   [%s] setup: %s\n' "$sh_bin" "$gname"
+  else fail=$((fail+1)); printf '  FAIL [%s] setup: %s --%s\n' "$sh_bin" "$gname" "$gwhy"; fi
   rm -rf "$ghome"
 }
 
@@ -349,10 +350,33 @@ tail content."
   swapped="<!-- FOCUS-LEDGER:END -->
 middle content.
 <!-- FOCUS-LEDGER:BEGIN — offer to park on pivot. Update or remove: /focus-ledger:setup -->"
-  run_setup_guard_case "guard: BEGIN-only install -> rc3, untouched, no backup"  install "$begin_only"
-  run_setup_guard_case "guard: BEGIN-only --remove -> rc3, untouched, no backup" remove  "$begin_only"
-  run_setup_guard_case "guard: END-only -> rc3, untouched, no backup"            install "$end_only"
-  run_setup_guard_case "guard: END-before-BEGIN -> rc3, untouched, no backup"    install "$swapped"
+  nested="<!-- FOCUS-LEDGER:BEGIN a -->
+outer
+<!-- FOCUS-LEDGER:BEGIN b -->
+inner
+<!-- FOCUS-LEDGER:END -->"
+  run_setup_guard_case "guard: BEGIN-only install -> rc3, untouched, no backup"  install "$begin_only" "never closed"
+  run_setup_guard_case "guard: BEGIN-only --remove -> rc3, untouched, no backup" remove  "$begin_only" "never closed"
+  run_setup_guard_case "guard: END-only -> rc3, untouched, no backup"            install "$end_only"   "no BEGIN open"
+  run_setup_guard_case "guard: END-before-BEGIN -> rc3, untouched, no backup"    install "$swapped"    "no BEGIN open"
+  run_setup_guard_case "guard: nested BEGINs -> rc3, untouched, no backup"       install "$nested"     "nested BEGIN"
+
+  # A refusal must not evict the last good backup either: healthy install first
+  # (creates a real .focus-bak), then mangle the file and re-run — the guard has
+  # to fire BEFORE the backup rotation, leaving the pre-existing backup intact.
+  bhome=$(mktemp -d)
+  bmd="$bhome/CLAUDE.md"
+  printf '# My rules\n\nkeep this line.\n' > "$bmd"
+  ( cd "$bhome" && env -i HOME="$bhome" PATH="$PATH" "$sh_bin" "$ROOT/scripts/focus-setup.sh" local >/dev/null 2>&1 )
+  nbak_before=$(ls "$bmd".focus-bak.* 2>/dev/null | wc -l | tr -d ' ')
+  # mangle: delete the END marker line the healthy install just wrote
+  grep -v 'FOCUS-LEDGER:END' "$bmd" > "$bmd.mangled" && mv "$bmd.mangled" "$bmd"
+  ( cd "$bhome" && env -i HOME="$bhome" PATH="$PATH" "$sh_bin" "$ROOT/scripts/focus-setup.sh" local >/dev/null 2>&1 ); brc=$?
+  nbak_after=$(ls "$bmd".focus-bak.* 2>/dev/null | wc -l | tr -d ' ')
+  if [ "$brc" = 3 ] && [ "$nbak_before" = 1 ] && [ "$nbak_after" = 1 ]; then
+    pass=$((pass+1)); printf '  ok   [%s] setup: refusal preserves the pre-existing backup\n' "$sh_bin"
+  else fail=$((fail+1)); printf '  FAIL [%s] setup: refusal backup handling (rc=%s, before=%s, after=%s)\n' "$sh_bin" "$brc" "$nbak_before" "$nbak_after"; fi
+  rm -rf "$bhome"
 }
 
 main() {

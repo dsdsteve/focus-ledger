@@ -47,12 +47,20 @@ mangled=$(awk '
     if (!why && depth != 0) why="BEGIN marker never closed by an END"
     if (why) printf "%s (found %d BEGIN, %d END)", why, nb+0, ne+0
   }
-' "$CLAUDE_MD")
+' "$CLAUDE_MD") || {
+  # Fail CLOSED with a clear message: an unverified file must never reach the strip.
+  printf 'focus-setup: marker scan failed for %s; refusing to continue.\n' "$CLAUDE_MD" >&2
+  exit 3
+}
 if [ -n "$mangled" ]; then
   {
-    echo "focus-setup: refusing to rewrite $CLAUDE_MD — FOCUS-LEDGER block is mangled: $mangled."
-    echo "  Nothing was written. To recover: restore the latest $CLAUDE_MD.focus-bak.* over it,"
-    echo "  or hand-delete the partial FOCUS-LEDGER block, then re-run."
+    printf 'focus-setup: refusing to rewrite %s — FOCUS-LEDGER block is mangled: %s.\n' "$CLAUDE_MD" "$mangled"
+    if ls "$CLAUDE_MD".focus-bak.* >/dev/null 2>&1; then
+      printf '  Nothing was written. To recover: restore the latest %s.focus-bak.* over it,\n' "$CLAUDE_MD"
+      printf '  or hand-delete the partial FOCUS-LEDGER block, then re-run.\n'
+    else
+      printf '  Nothing was written. To recover: hand-delete the partial FOCUS-LEDGER block, then re-run.\n'
+    fi
   } >&2
   exit 3
 fi
