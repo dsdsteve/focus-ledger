@@ -82,18 +82,20 @@ run_park_check() {
   command -v "$sh_bin" >/dev/null 2>&1 || return
   home=$(mktemp -d); mkdir -p "$home/.claude"
   cp "$FIX/populated.md" "$home/.claude/focus-ledger.md"
-  env -i HOME="$home" PATH="$PATH" "$sh_bin" "$ROOT/scripts/focus-park.sh" "newly parked" >/dev/null 2>&1; rc=$?
+  out=$(env -i HOME="$home" PATH="$PATH" "$sh_bin" "$ROOT/scripts/focus-park.sh" "newly parked" 2>/dev/null); rc=$?
   led=$(cat "$home/.claude/focus-ledger.md")
-  # Durability contract (story 1.2): rc 0 must coincide with the exact
-  # `- [ ] (date) text` line present, not just the text as a substring.
-  if [ "$rc" = 0 ] && printf '%s' "$led" | grep -qF "recent parked item" \
-     && grep -qxF -- "- [ ] ($TODAY) newly parked" "$home/.claude/focus-ledger.md"; then
+  # Durability contract (story 1.2): rc 0 must coincide with stdout being exactly
+  # the item text AND the exact `- [ ] (date) text` line present. The date is
+  # matched structurally so a midnight rollover between suite start and this park
+  # cannot flake the test.
+  if [ "$rc" = 0 ] && [ "$out" = "newly parked" ] && printf '%s' "$led" | grep -qF "recent parked item" \
+     && grep -q '^- \[ \] ([0-9]\{4\}-[0-9]\{2\}-[0-9]\{2\}) newly parked$' "$home/.claude/focus-ledger.md"; then
     pass=$((pass+1)); printf '  ok   [%s] park: appends and preserves existing item\n' "$sh_bin"
   else fail=$((fail+1)); printf '  FAIL [%s] park: lost an item (rc=%s)\n' "$sh_bin" "$rc"; fi
 
   # Backslashes in item text stay literal on one line (awk -v would eat \n).
-  env -i HOME="$home" PATH="$PATH" "$sh_bin" "$ROOT/scripts/focus-park.sh" 'fix the \n handling' >/dev/null 2>&1
-  if grep -qF 'fix the \n handling' "$home/.claude/focus-ledger.md"; then
+  env -i HOME="$home" PATH="$PATH" "$sh_bin" "$ROOT/scripts/focus-park.sh" 'fix the \n handling' >/dev/null 2>&1; rc=$?
+  if [ "$rc" = 0 ] && grep -qF 'fix the \n handling' "$home/.claude/focus-ledger.md"; then
     pass=$((pass+1)); printf '  ok   [%s] park: backslash item stays literal, one line\n' "$sh_bin"
   else fail=$((fail+1)); printf '  FAIL [%s] park: backslash item mangled\n' "$sh_bin"; fi
 
@@ -228,27 +230,49 @@ run_park_check() {
   # (the pre-1.2 failure mode exited 0 after losing the item). Fresh sandbox HOME so
   # the read-only dir can't leak into other cases; permissions restored before
   # cleanup so rm -rf works. (~3s: the lock retry windows all fail on EACCES first.)
-  home2=$(mktemp -d); mkdir -p "$home2/.claude"
-  chmod 500 "$home2/.claude"
-  out=$(env -i HOME="$home2" PATH="$PATH" "$sh_bin" "$ROOT/scripts/focus-park.sh" "doomed item" 2>"$home2/err3"); rc=$?
-  chmod 700 "$home2/.claude"
-  if [ "$rc" != 0 ] && [ -z "$out" ] && [ -s "$home2/err3" ]; then
-    pass=$((pass+1)); printf '  ok   [%s] park: unwritable dir -> non-zero rc, no success output\n' "$sh_bin"
-  else fail=$((fail+1)); printf '  FAIL [%s] park: unwritable dir (rc=%s, out=[%s])\n' "$sh_bin" "$rc" "$out"; fi
-  rm -rf "$home2"
+  if [ "$(id -u)" = 0 ]; then
+    printf '  (skip [%s] park: unwritable-dir case needs non-root — chmod cannot stop uid 0)\n' "$sh_bin"
+  else
+    home2=$(mktemp -d); mkdir -p "$home2/.claude"
+    chmod 500 "$home2/.claude"
+    out=$(env -i HOME="$home2" PATH="$PATH" "$sh_bin" "$ROOT/scripts/focus-park.sh" "doomed item" 2>"$home2/err3"); rc=$?
+    chmod 700 "$home2/.claude"
+    if [ "$rc" != 0 ] && [ -z "$out" ] && grep -qi -e "denied" -e "focus-park" "$home2/err3"; then
+      pass=$((pass+1)); printf '  ok   [%s] park: unwritable dir -> non-zero rc, no success output\n' "$sh_bin"
+    else fail=$((fail+1)); printf '  FAIL [%s] park: unwritable dir (rc=%s, out=[%s])\n' "$sh_bin" "$rc" "$out"; fi
+    rm -rf "$home2"
+  fi
 
   # Durability gate failure arm (story 1.2): when the post-write verification cannot
-  # confirm the item (grep stubbed to always fail; the write itself still lands via
-  # the append path), the park must withhold the success claim: empty stdout, error
-  # on stderr, non-zero rc — while the item text is still safely in the file.
+  # confirm the item (grep stubbed to always fail — deliberately intercepting EVERY
+  # grep call site, which also routes the write to the append path), the park must
+  # withhold the success claim: empty stdout, error on stderr, non-zero rc — while
+  # the exact item line is still safely in the file.
   stub3=$(mktemp -d)
   printf '#!/bin/sh\nexit 1\n' > "$stub3/grep"; chmod +x "$stub3/grep"
   out=$(env -i HOME="$home" PATH="$stub3:$PATH" "$sh_bin" "$ROOT/scripts/focus-park.sh" "unverifiable item" 2>"$home/err4"); rc=$?
   if [ "$rc" != 0 ] && [ -z "$out" ] && grep -q "verification failed" "$home/err4" \
-     && grep -qF "unverifiable item" "$home/.claude/focus-ledger.md"; then
+     && grep -q '^- \[ \] ([0-9]\{4\}-[0-9]\{2\}-[0-9]\{2\}) unverifiable item$' "$home/.claude/focus-ledger.md"; then
     pass=$((pass+1)); printf '  ok   [%s] park: failed verification -> no success claim, item kept\n' "$sh_bin"
   else fail=$((fail+1)); printf '  FAIL [%s] park: failed verification arm (rc=%s, out=[%s])\n' "$sh_bin" "$rc" "$out"; fi
   rm -rf "$stub3"
+
+  # Gate predicate (story 1.2): the gate must discriminate with a REAL grep. A
+  # rewrite whose mv silently does nothing (stub exits 0 without moving) leaves the
+  # exact new line absent while a decoy line carries the raw text as a substring —
+  # a weakened needle (substring match, missing -x, wrong variable) would accept
+  # the decoy and this case would FAIL. The stranded temp is the lying stub's
+  # artifact; the sandbox teardown sweeps it.
+  home4=$(mktemp -d); mkdir -p "$home4/.claude"
+  cp "$FIX/populated.md" "$home4/.claude/focus-ledger.md"
+  printf '%s\n' "- [x] (2020-01-01) note: mv stub item" >> "$home4/.claude/focus-ledger.md"
+  stub4=$(mktemp -d)
+  printf '#!/bin/sh\nexit 0\n' > "$stub4/mv"; chmod +x "$stub4/mv"
+  out=$(env -i HOME="$home4" PATH="$stub4:$PATH" "$sh_bin" "$ROOT/scripts/focus-park.sh" "mv stub item" 2>"$home4/err5"); rc=$?
+  if [ "$rc" != 0 ] && [ -z "$out" ] && grep -q "verification failed" "$home4/err5"; then
+    pass=$((pass+1)); printf '  ok   [%s] park: gate predicate needs the exact line, real grep\n' "$sh_bin"
+  else fail=$((fail+1)); printf '  FAIL [%s] park: gate predicate (rc=%s, out=[%s])\n' "$sh_bin" "$rc" "$out"; fi
+  rm -rf "$home4" "$stub4"
   rm -rf "$home"
 }
 
