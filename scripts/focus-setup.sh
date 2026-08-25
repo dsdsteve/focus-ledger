@@ -32,6 +32,31 @@ esac
 
 mkdir -p "$(dirname "$CLAUDE_MD")"
 touch "$CLAUDE_MD"
+
+# Refuse-before-write guard: with a mangled managed block (say, the END marker
+# hand-deleted), the strip below would set skip=1 at BEGIN and never clear it —
+# silently deleting every user line after the marker. Depth-walk the markers
+# first (same regexes the strip uses): BEGIN opens, END closes; an END with
+# nothing open, nested BEGINs, or an unclosed BEGIN at EOF refuses with rc 3
+# (bad args stay rc 2) and writes NOTHING. This sits before the backup rotation
+# so the refused path can't evict the last good backup either.
+mangled=$(awk '
+  /<!-- FOCUS-LEDGER:BEGIN/ { nb++; depth++; if (depth > 1 && !why) why="nested BEGIN markers" }
+  /FOCUS-LEDGER:END -->/    { ne++; depth--; if (depth < 0 && !why) why="END marker with no BEGIN open before it" }
+  END {
+    if (!why && depth != 0) why="BEGIN marker never closed by an END"
+    if (why) printf "%s (found %d BEGIN, %d END)", why, nb+0, ne+0
+  }
+' "$CLAUDE_MD")
+if [ -n "$mangled" ]; then
+  {
+    echo "focus-setup: refusing to rewrite $CLAUDE_MD — FOCUS-LEDGER block is mangled: $mangled."
+    echo "  Nothing was written. To recover: restore the latest $CLAUDE_MD.focus-bak.* over it,"
+    echo "  or hand-delete the partial FOCUS-LEDGER block, then re-run."
+  } >&2
+  exit 3
+fi
+
 # Keep only the latest backup — repeated runs would otherwise pile up
 # CLAUDE.md.focus-bak.* files in the project root (easy to commit by accident).
 rm -f "$CLAUDE_MD".focus-bak.* 2>/dev/null || true

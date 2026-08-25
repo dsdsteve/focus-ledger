@@ -276,6 +276,33 @@ run_park_check() {
   rm -rf "$home"
 }
 
+# One refused-setup case (story 1.3): seed CLAUDE.md with mangled markers, run
+# setup (install or --remove), and require the refusal contract: rc 3, file
+# byte-identical (cksum — "$(cat)" would eat trailing-newline differences), no
+# backup created or rotated, and a recovery hint on stderr.
+run_setup_guard_case() {
+  gname=$1; gmode=$2; gcontent=$3
+  ghome=$(mktemp -d)
+  gmd="$ghome/CLAUDE.md"
+  printf '%s\n' "$gcontent" > "$gmd"
+  gbefore=$(cksum < "$gmd")
+  if [ "$gmode" = remove ]; then
+    ( cd "$ghome" && env -i HOME="$ghome" PATH="$PATH" "$sh_bin" "$ROOT/scripts/focus-setup.sh" local --remove >/dev/null 2>"$ghome/gerr" ); grc=$?
+  else
+    ( cd "$ghome" && env -i HOME="$ghome" PATH="$PATH" "$sh_bin" "$ROOT/scripts/focus-setup.sh" local >/dev/null 2>"$ghome/gerr" ); grc=$?
+  fi
+  gafter=$(cksum < "$gmd")
+  gnbak=$(ls "$gmd".focus-bak.* 2>/dev/null | wc -l | tr -d ' ')
+  ok=1; why=""
+  [ "$grc" = 3 ] || { ok=0; why="rc=$grc want 3"; }
+  [ "$gbefore" = "$gafter" ] || { ok=0; why="$why; file changed"; }
+  [ "$gnbak" = 0 ] || { ok=0; why="$why; $gnbak backups (want 0)"; }
+  grep -q "recover" "$ghome/gerr" || { ok=0; why="$why; no recovery hint on stderr"; }
+  if [ "$ok" = 1 ]; then pass=$((pass+1)); printf '  ok   [%s] setup: %s\n' "$sh_bin" "$gname"
+  else fail=$((fail+1)); printf '  FAIL [%s] setup: %s -- %s\n' "$sh_bin" "$gname" "$why"; fi
+  rm -rf "$ghome"
+}
+
 # --- setup: idempotent CLAUDE.md block; preserves existing content; clean remove ---
 run_setup_check() {
   sh_bin=$1
@@ -305,6 +332,27 @@ run_setup_check() {
     pass=$((pass+1)); printf '  ok   [%s] setup: --remove clears block, keeps content\n' "$sh_bin"
   else fail=$((fail+1)); printf '  FAIL [%s] setup: after remove blocks=%s kept=%s (want 0/1)\n' "$sh_bin" "$n2" "$kept2"; fi
   rm -rf "$home"
+
+  # Guard (story 1.3): unbalanced or out-of-order markers must refuse before
+  # any write — on install AND --remove. The BEGIN-only fixture mirrors the
+  # reproduced truncation bug: user content after a dangling BEGIN.
+  begin_only="# My rules
+
+keep this line.
+<!-- FOCUS-LEDGER:BEGIN — offer to park on pivot. Update or remove: /focus-ledger:setup -->
+user content after the dangling marker."
+  end_only="# My rules
+
+keep this line.
+<!-- FOCUS-LEDGER:END -->
+tail content."
+  swapped="<!-- FOCUS-LEDGER:END -->
+middle content.
+<!-- FOCUS-LEDGER:BEGIN — offer to park on pivot. Update or remove: /focus-ledger:setup -->"
+  run_setup_guard_case "guard: BEGIN-only install -> rc3, untouched, no backup"  install "$begin_only"
+  run_setup_guard_case "guard: BEGIN-only --remove -> rc3, untouched, no backup" remove  "$begin_only"
+  run_setup_guard_case "guard: END-only -> rc3, untouched, no backup"            install "$end_only"
+  run_setup_guard_case "guard: END-before-BEGIN -> rc3, untouched, no backup"    install "$swapped"
 }
 
 main() {
