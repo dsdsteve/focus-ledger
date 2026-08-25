@@ -236,6 +236,19 @@ run_park_check() {
     pass=$((pass+1)); printf '  ok   [%s] park: unwritable dir -> non-zero rc, no success output\n' "$sh_bin"
   else fail=$((fail+1)); printf '  FAIL [%s] park: unwritable dir (rc=%s, out=[%s])\n' "$sh_bin" "$rc" "$out"; fi
   rm -rf "$home2"
+
+  # Durability gate failure arm (story 1.2): when the post-write verification cannot
+  # confirm the item (grep stubbed to always fail; the write itself still lands via
+  # the append path), the park must withhold the success claim: empty stdout, error
+  # on stderr, non-zero rc — while the item text is still safely in the file.
+  stub3=$(mktemp -d)
+  printf '#!/bin/sh\nexit 1\n' > "$stub3/grep"; chmod +x "$stub3/grep"
+  out=$(env -i HOME="$home" PATH="$stub3:$PATH" "$sh_bin" "$ROOT/scripts/focus-park.sh" "unverifiable item" 2>"$home/err4"); rc=$?
+  if [ "$rc" != 0 ] && [ -z "$out" ] && grep -q "verification failed" "$home/err4" \
+     && grep -qF "unverifiable item" "$home/.claude/focus-ledger.md"; then
+    pass=$((pass+1)); printf '  ok   [%s] park: failed verification -> no success claim, item kept\n' "$sh_bin"
+  else fail=$((fail+1)); printf '  FAIL [%s] park: failed verification arm (rc=%s, out=[%s])\n' "$sh_bin" "$rc" "$out"; fi
+  rm -rf "$stub3"
   rm -rf "$home"
 }
 
