@@ -100,6 +100,30 @@ run_park_check() {
   if grep -qF "after stale lock" "$home/.claude/focus-ledger.md" && [ ! -d "$home/.claude/focus-ledger.md.lock" ]; then
     pass=$((pass+1)); printf '  ok   [%s] park: reaps stale lock and proceeds\n' "$sh_bin"
   else fail=$((fail+1)); printf '  FAIL [%s] park: stale lock not reaped\n' "$sh_bin"; fi
+
+  # Regression (story 1.1): a lock held past every wait window while two parks race.
+  # Both time out together, reap, and must serialize — afterwards both new items AND
+  # the pre-existing one are present (possibly EOF-appended), and nothing is left
+  # behind: no lock, no reap token, no mktemp litter (anything focus-ledger.md.*).
+  lockdir="$home/.claude/focus-ledger.md.lock"
+  mkdir "$lockdir"
+  ( sleep 3; rmdir "$lockdir" 2>/dev/null ) &
+  holder=$!
+  env -i HOME="$home" PATH="$PATH" "$sh_bin" "$ROOT/scripts/focus-park.sh" "race item alpha" >/dev/null 2>&1 &
+  ra=$!
+  env -i HOME="$home" PATH="$PATH" "$sh_bin" "$ROOT/scripts/focus-park.sh" "race item bravo" >/dev/null 2>&1 &
+  rb=$!
+  wait "$ra" "$rb"
+  wait "$holder"
+  led=$(cat "$home/.claude/focus-ledger.md")
+  ok=1; why=""
+  for want in "race item alpha" "race item bravo" "recent parked item"; do
+    printf '%s' "$led" | grep -qF "$want" || { ok=0; why="$why; missing '$want'"; }
+  done
+  set -- "$home/.claude/focus-ledger.md."*
+  if [ -e "$1" ]; then ok=0; why="$why; leftover: $*"; fi
+  if [ "$ok" = 1 ]; then pass=$((pass+1)); printf '  ok   [%s] park: race on held lock keeps every item, no litter\n' "$sh_bin"
+  else fail=$((fail+1)); printf '  FAIL [%s] park: race on held lock -- %s\n' "$sh_bin" "$why"; fi
   rm -rf "$home"
 }
 
