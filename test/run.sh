@@ -124,6 +124,36 @@ run_park_check() {
   if [ -e "$1" ]; then ok=0; why="$why; leftover: $*"; fi
   if [ "$ok" = 1 ]; then pass=$((pass+1)); printf '  ok   [%s] park: race on held lock keeps every item, no litter\n' "$sh_bin"
   else fail=$((fail+1)); printf '  FAIL [%s] park: race on held lock -- %s\n' "$sh_bin" "$why"; fi
+
+  # Matrix: brief live contention -> acquires within the primary window, normal
+  # insert into the Parked section (not the EOF-append fallback).
+  mkdir "$home/.claude/focus-ledger.md.lock"
+  ( sleep 0.4; rmdir "$home/.claude/focus-ledger.md.lock" 2>/dev/null ) &
+  bh=$!
+  env -i HOME="$home" PATH="$PATH" "$sh_bin" "$ROOT/scripts/focus-park.sh" "brief contention item" >/dev/null 2>&1
+  wait "$bh"
+  if awk '/^## This session/{exit} /brief contention item/{found=1} END{exit !found}' "$home/.claude/focus-ledger.md"; then
+    pass=$((pass+1)); printf '  ok   [%s] park: brief contention -> primary-window acquire, normal insert\n' "$sh_bin"
+  else fail=$((fail+1)); printf '  FAIL [%s] park: brief contention item missing from Parked section\n' "$sh_bin"; fi
+
+  # Matrix: lock unacquirable for the entire window (reap token held too, so the
+  # reap is skipped) -> degrade to the atomic EOF append; rc 0; stdout intact.
+  mkdir "$home/.claude/focus-ledger.md.lock" "$home/.claude/focus-ledger.md.lock.reap"
+  out=$(env -i HOME="$home" PATH="$PATH" "$sh_bin" "$ROOT/scripts/focus-park.sh" "unacquirable window item" 2>/dev/null); rc=$?
+  last=$(tail -1 "$home/.claude/focus-ledger.md")
+  rmdir "$home/.claude/focus-ledger.md.lock" "$home/.claude/focus-ledger.md.lock.reap"
+  case $last in *"unacquirable window item") lastok=1 ;; *) lastok=0 ;; esac
+  if [ "$rc" = 0 ] && [ "$out" = "unacquirable window item" ] && [ "$lastok" = 1 ]; then
+    pass=$((pass+1)); printf '  ok   [%s] park: unacquirable lock -> EOF append, rc 0\n' "$sh_bin"
+  else fail=$((fail+1)); printf '  FAIL [%s] park: unacquirable lock (rc=%s, last=[%s])\n' "$sh_bin" "$rc" "$last"; fi
+
+  # Matrix: empty argument -> rc 2, "nothing to park" on stderr, ledger untouched.
+  before=$(cat "$home/.claude/focus-ledger.md")
+  env -i HOME="$home" PATH="$PATH" "$sh_bin" "$ROOT/scripts/focus-park.sh" "" >/dev/null 2>"$home/err2"; rc=$?
+  after=$(cat "$home/.claude/focus-ledger.md")
+  if [ "$rc" = 2 ] && grep -q "nothing to park" "$home/err2" && [ "$before" = "$after" ]; then
+    pass=$((pass+1)); printf '  ok   [%s] park: empty argument -> rc 2, ledger untouched\n' "$sh_bin"
+  else fail=$((fail+1)); printf '  FAIL [%s] park: empty argument (rc=%s)\n' "$sh_bin" "$rc"; fi
   rm -rf "$home"
 }
 
