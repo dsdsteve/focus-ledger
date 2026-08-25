@@ -82,11 +82,14 @@ run_park_check() {
   command -v "$sh_bin" >/dev/null 2>&1 || return
   home=$(mktemp -d); mkdir -p "$home/.claude"
   cp "$FIX/populated.md" "$home/.claude/focus-ledger.md"
-  env -i HOME="$home" PATH="$PATH" "$sh_bin" "$ROOT/scripts/focus-park.sh" "newly parked" >/dev/null 2>&1
+  env -i HOME="$home" PATH="$PATH" "$sh_bin" "$ROOT/scripts/focus-park.sh" "newly parked" >/dev/null 2>&1; rc=$?
   led=$(cat "$home/.claude/focus-ledger.md")
-  if printf '%s' "$led" | grep -qF "recent parked item" && printf '%s' "$led" | grep -qF "newly parked"; then
+  # Durability contract (story 1.2): rc 0 must coincide with the exact
+  # `- [ ] (date) text` line present, not just the text as a substring.
+  if [ "$rc" = 0 ] && printf '%s' "$led" | grep -qF "recent parked item" \
+     && grep -qxF -- "- [ ] ($TODAY) newly parked" "$home/.claude/focus-ledger.md"; then
     pass=$((pass+1)); printf '  ok   [%s] park: appends and preserves existing item\n' "$sh_bin"
-  else fail=$((fail+1)); printf '  FAIL [%s] park: lost an item\n' "$sh_bin"; fi
+  else fail=$((fail+1)); printf '  FAIL [%s] park: lost an item (rc=%s)\n' "$sh_bin" "$rc"; fi
 
   # Backslashes in item text stay literal on one line (awk -v would eat \n).
   env -i HOME="$home" PATH="$PATH" "$sh_bin" "$ROOT/scripts/focus-park.sh" 'fix the \n handling' >/dev/null 2>&1
@@ -219,6 +222,20 @@ run_park_check() {
   if [ "$ok" = 1 ]; then
     pass=$((pass+1)); printf '  ok   [%s] park: lockless first park writes skeleton, next park structured\n' "$sh_bin"
   else fail=$((fail+1)); printf '  FAIL [%s] park: lockless first park left ledger headingless\n' "$sh_bin"; fi
+
+  # Failure path (story 1.2): an unwritable ~/.claude means nothing can land, so the
+  # park must exit non-zero with NO success text on stdout and an error on stderr
+  # (the pre-1.2 failure mode exited 0 after losing the item). Fresh sandbox HOME so
+  # the read-only dir can't leak into other cases; permissions restored before
+  # cleanup so rm -rf works. (~3s: the lock retry windows all fail on EACCES first.)
+  home2=$(mktemp -d); mkdir -p "$home2/.claude"
+  chmod 500 "$home2/.claude"
+  out=$(env -i HOME="$home2" PATH="$PATH" "$sh_bin" "$ROOT/scripts/focus-park.sh" "doomed item" 2>"$home2/err3"); rc=$?
+  chmod 700 "$home2/.claude"
+  if [ "$rc" != 0 ] && [ -z "$out" ] && [ -s "$home2/err3" ]; then
+    pass=$((pass+1)); printf '  ok   [%s] park: unwritable dir -> non-zero rc, no success output\n' "$sh_bin"
+  else fail=$((fail+1)); printf '  FAIL [%s] park: unwritable dir (rc=%s, out=[%s])\n' "$sh_bin" "$rc" "$out"; fi
+  rm -rf "$home2"
   rm -rf "$home"
 }
 

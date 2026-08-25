@@ -184,4 +184,16 @@ if [ -n "$reaping" ]; then
   rmdir "$REAP" 2>/dev/null || true
 fi
 
+# Durability gate: exit 0 must MEAN "the item is verifiably in the ledger", not
+# merely "no command in the chain happened to fail" (the 8bbe4b7 race exited 0 after
+# LOSING its item). Re-read the ledger and require the exact item line before
+# claiming success: -x whole-line, -F fixed-string, and -- so the item's leading
+# dash can't be parsed as a grep option. grep's own stderr is silenced (e.g. the
+# ledger vanished mid-park) in favor of one clear message. Written as an explicit
+# `if !` so the probe itself can't trip the active `set -e`.
+if ! grep -qxF -- "$item" "$LEDGER" 2>/dev/null; then
+  printf 'focus-park: write verification failed: item not found in %s\n' "$LEDGER" >&2
+  exit 1
+fi
+
 printf '%s\n' "$thing"
