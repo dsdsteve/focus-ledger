@@ -5,9 +5,11 @@
 # the assistant to keep working (per Claude Code hooks docs: Stop exit 0 + systemMessage).
 #
 # Opt-outs (soft by design):
-#   FOCUS_STOP_NUDGE=off      -> disable entirely
-#   FOCUS_STALE_DAYS=<n>      -> staleness threshold in days (default 7)
-#   ~/.claude/.focus-snooze   -> if it holds a future epoch, stay silent until then
+#   FOCUS_STOP_NUDGE=off       -> disable entirely
+#   FOCUS_STALE_DAYS=<n>       -> staleness threshold in days (default 7)
+#   FOCUS_NUDGE_COOLDOWN=<n>   -> seconds between nudges (default 14400; 0 disables)
+#   ~/.claude/.focus-snooze    -> if it holds a future epoch, stay silent until then
+#   ~/.claude/.focus-last-nudge -> if it holds a future epoch, cooldown is active
 set -u
 
 [ "${FOCUS_STOP_NUDGE:-}" = "off" ] && exit 0
@@ -15,12 +17,47 @@ set -u
 LEDGER="$HOME/.claude/focus-ledger.md"
 [ -f "$LEDGER" ] || exit 0
 
-# Snooze: silent while the snooze epoch is in the future.
-SNOOZE="$HOME/.claude/.focus-snooze"
+# Epoch files are advisory. Accept only bounded, non-negative decimal text so a
+# malformed marker can never make a soft hook fail with an integer-expression error.
+is_safe_epoch() {
+  epoch_value=$1
+  case $epoch_value in
+    ''|*[!0-9]*) return 1 ;;
+  esac
+  [ "${#epoch_value}" -le 18 ]
+}
+
 now=$(date +%s)
+
+# Snooze: silent while the snooze epoch is in the future. Remove an expired
+# numeric marker before evaluating the ordinary stale-item nudge.
+SNOOZE="$HOME/.claude/.focus-snooze"
 if [ -f "$SNOOZE" ]; then
-  until_ts=$(head -1 "$SNOOZE" 2>/dev/null | tr -dc '0-9')
-  [ -n "$until_ts" ] && [ "$now" -lt "$until_ts" ] && exit 0
+  until_ts=
+  IFS= read -r until_ts 2>/dev/null < "$SNOOZE" || :
+  if is_safe_epoch "$until_ts"; then
+    [ "$now" -lt "$until_ts" ] 2>/dev/null && exit 0
+    rm -f "$SNOOZE" 2>/dev/null || :
+  fi
+fi
+
+# Invalid, negative, leading-zero, or impractically large values safely fall
+# back to four hours. Keeping the accepted value to nine digits also keeps the
+# addition below the integer range used by the supported shells.
+cooldown=${FOCUS_NUDGE_COOLDOWN:-14400}
+case $cooldown in
+  0) ;;
+  ''|*[!0-9]*|0*) cooldown=14400 ;;
+  *) [ "${#cooldown}" -le 9 ] || cooldown=14400 ;;
+esac
+
+LAST_NUDGE="$HOME/.claude/.focus-last-nudge"
+if [ "$cooldown" -gt 0 ] && [ -f "$LAST_NUDGE" ]; then
+  next_nudge=
+  IFS= read -r next_nudge 2>/dev/null < "$LAST_NUDGE" || :
+  if is_safe_epoch "$next_nudge" && [ "$now" -lt "$next_nudge" ] 2>/dev/null; then
+    exit 0
+  fi
 fi
 
 threshold=${FOCUS_STALE_DAYS:-7}
@@ -30,7 +67,8 @@ today_days=$(( now / 86400 ))   # whole days since epoch, UTC
 # The date is parsed and compared ENTIRELY inside awk with integer arithmetic
 # (Hinnant days-from-civil) — no shell-out, no date(1) fork, no getline. This is
 # both safe (no ledger text ever reaches a shell) and portable (works on BSD awk,
-# which lacks mktime()). Only the strict 4-2-2 digit groups are read.
+# which lacks mktime()). Only the strict 4-2-2 digit groups are read. The same
+# pass counts matches and joins the first three labels for the final message.
 stale=$(awk -v today="$today_days" -v thr="$threshold" '
   # Lines inside <!-- --> blocks are format examples, not items (format v1) — skip.
   incom { if (index($0, "-->")) incom=0; next }
@@ -51,28 +89,52 @@ stale=$(awk -v today="$today_days" -v thr="$threshold" '
       if (age >= thr) {
         lbl = $0
         sub(/^- \[ \] \([0-9-]+\) /, "", lbl)
-        print lbl
+        count++
+        if (count <= 3) {
+          if (count > 1) summary = summary "; "
+          summary = summary lbl
+        }
       }
     }
+  }
+  END {
+    if (count > 3) summary = summary "; +" (count - 3) " more"
+    if (count > 0) print summary
   }
 ' "$LEDGER")
 
 [ -z "$stale" ] && exit 0
 
-# Compact message: up to 3 items, then "+N more". Joined in awk — paste -sd '; '
-# treats '; ' as a cycling delimiter LIST (a;b c), not a two-char separator.
-n=$(printf '%s\n' "$stale" | grep -c .)
-head3=$(printf '%s\n' "$stale" | head -3 | awk 'NR>1{printf "; "} {printf "%s", $0}')
-if [ "$n" -gt 3 ]; then head3="$head3; +$((n-3)) more"; fi
+msg="Open a while: $stale. Run /focus-ledger:focus to view, or /focus-ledger:snooze to hide. (Only shows when something's been sitting past $threshold days.)"
 
-msg="Open a while: $head3. Run /focus-ledger:focus to view, or /focus-ledger:snooze to hide. (Only shows when something's been sitting past $threshold days.)"
+# Write the advisory epoch through a private same-directory file. Removing the
+# destination before the rename avoids following a symlink or blocking on a FIFO;
+# any failure simply leaves the hook fail-open for a later nudge.
+write_nudge_marker() {
+  marker_value=$1
+  marker_tmp="${LAST_NUDGE}.tmp.$$"
+  if (umask 077; set -C; printf '%s\n' "$marker_value" > "$marker_tmp") 2>/dev/null; then
+    if rm -f "$LAST_NUDGE" 2>/dev/null && mv -f "$marker_tmp" "$LAST_NUDGE" 2>/dev/null; then
+      return 0
+    fi
+    rm -f "$marker_tmp" 2>/dev/null || :
+  fi
+  return 0
+}
 
 # Emit as JSON systemMessage. jq handles all escaping; the fallback strips control
 # chars first (a raw tab/newline in item text would otherwise make invalid JSON).
+# Only a successful serializer consumes the cooldown window.
+emitted=0
 if command -v jq >/dev/null 2>&1; then
-  printf '%s' "$msg" | jq -R -s '{systemMessage: .}'
+  if printf '%s' "$msg" | jq -R -s '{systemMessage: .}'; then emitted=1; fi
 else
-  esc=$(printf '%s' "$msg" | tr -d '\000-\037' | sed 's/\\/\\\\/g; s/"/\\"/g')
-  printf '{"systemMessage": "%s"}' "$esc"
+  if esc=$(printf '%s' "$msg" | tr -d '\000-\037' | sed 's/\\/\\\\/g; s/"/\\"/g'); then
+    if printf '{"systemMessage": "%s"}' "$esc"; then emitted=1; fi
+  fi
 fi
+[ "$emitted" = 1 ] || exit 0
+
+next_nudge=$((now + cooldown))
+write_nudge_marker "$next_nudge"
 exit 0
