@@ -47,12 +47,16 @@ case $cooldown in
 esac
 
 LAST_NUDGE="$HOME/.claude/.focus-last-nudge"
-if [ "$cooldown" -gt 0 ] && [ -f "$LAST_NUDGE" ]; then
-  next_nudge=
-  IFS= read -r next_nudge 2>/dev/null < "$LAST_NUDGE" || :
-  if focus_is_safe_epoch "$next_nudge" && [ "$now" -lt "$next_nudge" ] 2>/dev/null; then
+if [ "$cooldown" -gt 0 ]; then
+  if ! focus_lock_acquire "$LAST_NUDGE"; then
+    focus_lock_release
     exit 0
   fi
+  last_nudge_state=$(focus_marker_status "$LAST_NUDGE" "$now")
+  focus_lock_release
+  case $last_nudge_state in
+    active*) exit 0 ;;
+  esac
 fi
 
 threshold=$(focus_stale_threshold) || exit 0
@@ -65,7 +69,10 @@ msg="Open a while: $stale. Run /focus-ledger:focus to view, or /focus-ledger:sno
 # Marker writes fail open. The shared primitive replaces symlinks/FIFOs rather
 # than following them and publishes through a private same-directory file.
 write_nudge_marker() {
-  focus_write_marker "$LAST_NUDGE" "$1" || :
+  if focus_lock_acquire "$LAST_NUDGE"; then
+    focus_write_marker "$LAST_NUDGE" "$1" || :
+  fi
+  focus_lock_release
   return 0
 }
 

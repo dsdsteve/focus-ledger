@@ -1,14 +1,19 @@
-# Shared focus-ledger parser, date math, ranked listing, matcher, and rewrites.
-# Configuration is supplied through ENVIRON so user-owned text is never treated as
-# awk source and backslashes are not transformed by awk -v assignment parsing.
+# Shared focus-ledger parser, date math, ranked listing, matcher, diagnostics,
+# tidy classification, and rewrites. Configuration is supplied through ENVIRON
+# so user-owned text is never treated as awk source and backslashes are not
+# transformed by awk -v assignment parsing.
 
 BEGIN {
   mode = ENVIRON["FOCUS_PARSE_MODE"]
   parked_head = ENVIRON["FOCUS_PARKED_HEAD"]
   session_head = ENVIRON["FOCUS_SESSION_HEAD"]
   display_ledger = ENVIRON["FOCUS_DISPLAY_LEDGER"]
+  ledger_path = ENVIRON["FOCUS_LEDGER_PATH"]
+  archive_path = ENVIRON["FOCUS_ARCHIVE_PATH"]
+  marker_path = ENVIRON["FOCUS_MARKER_PATH"]
   today = ENVIRON["FOCUS_TODAY_DAYS"] + 0
   threshold = ENVIRON["FOCUS_STALE_THRESHOLD"] + 0
+  archive_days = ENVIRON["FOCUS_ARCHIVE_DAYS"] + 0
   query = ENVIRON["FOCUS_MATCH_QUERY"]
   eligible = ENVIRON["FOCUS_MATCH_ELIGIBLE"]
   rewrite_item = ENVIRON["FOCUS_REWRITE_ITEM"]
@@ -16,6 +21,7 @@ BEGIN {
   calendar_date = ENVIRON["FOCUS_CALENDAR_DATE"]
   exact_section = "outside"
   legacy_section = "outside"
+  diagnostic_section = "outside"
   tab_char = sprintf("%c", 9)
   carriage_char = sprintf("%c", 13)
   numeric_query = (query ~ /^[0-9]+$/)
@@ -26,6 +32,11 @@ BEGIN {
   } else if (query != "") {
     match_word_count = split(tolower(query), match_words, / +/)
   }
+
+  diagnostic_mode = (mode == "doctor" || mode == "tidy-report" || \
+    mode == "tidy-rewrite" || mode == "tidy-archive" || \
+    mode == "raw-open" || mode == "raw-near" || \
+    mode == "raw-retained" || mode == "structure-check")
 
   if (mode == "date-days") {
     date_days_result = calendar_days(calendar_date)
@@ -67,7 +78,7 @@ function calendar_days(value,   y, m, d) {
   return days_from_civil(y, m, d)
 }
 
-# Sets parsed_date, parsed_text, and parsed_days for a strict format-v1 open item.
+# Set parsed_date, parsed_text, and parsed_days for a strict format-v1 item.
 function parse_valid_open(line) {
   parsed_date = ""
   parsed_text = ""
@@ -80,15 +91,96 @@ function parse_valid_open(line) {
   return 1
 }
 
+function parse_valid_done(line) {
+  parsed_date = ""
+  parsed_text = ""
+  parsed_days = 0
+  if (line !~ /^- \[x\] \([0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]\) /) return 0
+  parsed_date = substr(line, 8, 10)
+  parsed_days = calendar_days(parsed_date)
+  if (!calendar_valid) return 0
+  parsed_text = substr(line, 20)
+  return 1
+}
+
+# Classify only lines close enough to format-v1 item syntax that hooks could
+# silently skip them. Sets diagnostic_kind and diagnostic_reason.
+function classify_item(line,   date_value) {
+  diagnostic_kind = ""
+  diagnostic_reason = ""
+  if (line ~ /^[[:space:]][[:space:]]*- \[/) {
+    diagnostic_kind = "near"
+    diagnostic_reason = "leading-indentation"
+    return
+  }
+  if (line ~ /^[*+] \[/) {
+    diagnostic_kind = "near"
+    diagnostic_reason = "bullet-shape"
+    return
+  }
+  if (line ~ /^- \[ \]/) {
+    if (parse_valid_open(line)) diagnostic_kind = "open"
+    else diagnostic_kind = "near"
+  } else if (line ~ /^- \[x\]/) {
+    if (parse_valid_done(line)) diagnostic_kind = "done"
+    else diagnostic_kind = "near"
+  } else if (line ~ /^- \[\]/) {
+    diagnostic_kind = "near"
+    diagnostic_reason = "checkbox-empty"
+    return
+  } else if (line ~ /^-\[/) {
+    diagnostic_kind = "near"
+    diagnostic_reason = "checkbox-spacing"
+    return
+  } else if (line ~ /^- \[[^]]*\]/) {
+    diagnostic_kind = "near"
+    diagnostic_reason = "checkbox-shape"
+    return
+  } else if (line ~ /^- \[/) {
+    diagnostic_kind = "near"
+    diagnostic_reason = "checkbox-shape"
+    return
+  } else {
+    return
+  }
+
+  if (diagnostic_kind != "near") return
+  if (substr(line, 6, 2) != " (") {
+    diagnostic_reason = "missing-date"
+    return
+  }
+  date_value = substr(line, 8, 10)
+  if (date_value !~ /^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]$/) {
+    diagnostic_reason = "malformed-date"
+    return
+  }
+  diagnostic_days = calendar_days(date_value)
+  if (!calendar_valid) {
+    diagnostic_reason = "impossible-date"
+    return
+  }
+  if (substr(line, 18, 2) != ") ") {
+    diagnostic_reason = "malformed-date-envelope"
+    return
+  }
+  diagnostic_reason = "malformed-item"
+}
+
 # Return true for every record belonging to a format-v1 column-one HTML comment.
 # This is the single comment state machine used by hooks, readers, and rewrites.
 function comment_record(line) {
   if (comment_open) {
-    if (index(line, "-->")) comment_open = 0
+    if (index(line, "-->")) {
+      comment_open = 0
+      comment_open_line = 0
+    }
     return 1
   }
   if (index(line, "<!--") == 1) {
-    if (!index(line, "-->")) comment_open = 1
+    if (!index(line, "-->")) {
+      comment_open = 1
+      comment_open_line = FNR
+    }
     return 1
   }
   return 0
@@ -108,6 +200,65 @@ function tsv_escape(value,   result, i, ch) {
     else result = result ch
   }
   return result
+}
+
+function emit_record(level, code, path, line_number, action, detail) {
+  if (line_number == "") line_number = "-"
+  printf "%s\t%s\t%s\t%s\t%s\t%s\n", level, code, \
+    tsv_escape(path), line_number, tsv_escape(action), tsv_escape(detail)
+}
+
+function store_record(level, code, path, line_number, action, detail) {
+  diagnostic_record_count++
+  diagnostic_level[diagnostic_record_count] = level
+  diagnostic_code[diagnostic_record_count] = code
+  diagnostic_path[diagnostic_record_count] = path
+  diagnostic_line[diagnostic_record_count] = line_number
+  diagnostic_action[diagnostic_record_count] = action
+  diagnostic_detail[diagnostic_record_count] = detail
+}
+
+function store_heading_issue(code, line_number, action, detail) {
+  heading_issue_count++
+  heading_issue_code[heading_issue_count] = code
+  heading_issue_line[heading_issue_count] = line_number
+  heading_issue_action[heading_issue_count] = action
+  heading_issue_detail[heading_issue_count] = detail
+}
+
+function collect_structure_issues(   i) {
+  if (parked_heading_count == 0) {
+    store_heading_issue("heading-missing-parked", "-", \
+      "add the exact required Parked heading", parked_head)
+  }
+  if (session_heading_count == 0) {
+    store_heading_issue("heading-missing-session", "-", \
+      "add the exact required This session heading", session_head)
+  }
+  for (i = 2; i <= parked_heading_count; i++) {
+    store_heading_issue("heading-duplicate-parked", parked_heading_line[i], \
+      "remove the duplicate exact Parked heading", parked_head)
+  }
+  for (i = 2; i <= session_heading_count; i++) {
+    store_heading_issue("heading-duplicate-session", session_heading_line[i], \
+      "remove the duplicate exact This session heading", session_head)
+  }
+  if (parked_heading_count > 0 && session_heading_count > 0 && \
+      parked_heading_line[1] > session_heading_line[1]) {
+    store_heading_issue("heading-out-of-order", session_heading_line[1], \
+      "place Parked before This session", \
+      "required section headings are out of order")
+  }
+  if (comment_open) {
+    store_heading_issue("ledger-comment-unclosed", comment_open_line, \
+      "close the column-one HTML comment", \
+      "an unclosed comment hides the remaining ledger from parsers")
+  }
+}
+
+function structure_valid() {
+  return parked_heading_count == 1 && session_heading_count == 1 && \
+    parked_heading_line[1] < session_heading_line[1] && !comment_open
 }
 
 function words_match(text,   lowered, word_i) {
@@ -144,6 +295,30 @@ function flush_rewrite_blanks(   blank_i) {
 }
 
 {
+  if (mode == "markers") {
+    if (index($0, "<!-- FOCUS-LEDGER:BEGIN")) {
+      marker_depth++
+      marker_begin_line[marker_depth] = FNR
+      if (marker_depth > 1) {
+        emit_record("ERROR", "marker-nested-begin", marker_path, FNR, \
+          "remove the nested managed-block marker", \
+          "FOCUS-LEDGER BEGIN appears inside an open managed block")
+      }
+    }
+    if (index($0, "FOCUS-LEDGER:END -->")) {
+      if (marker_depth == 0) {
+        emit_record("ERROR", "marker-unmatched-end", marker_path, FNR, \
+          "remove the unmatched END or restore its BEGIN", \
+          "FOCUS-LEDGER END has no open BEGIN")
+      } else {
+        delete marker_begin_line[marker_depth]
+        marker_depth--
+        if (marker_depth == 0) marker_block_count++
+      }
+    }
+    next
+  }
+
   is_comment = comment_record($0)
 
   if (mode == "park-insert") {
@@ -201,6 +376,108 @@ function flush_rewrite_blanks(   blank_i) {
       next
     }
     print
+    next
+  }
+
+  if (diagnostic_mode) {
+    diagnostic_source_line[FNR] = $0
+    diagnostic_source_count = FNR
+    if (is_comment) next
+
+    if ($0 == parked_head) {
+      parked_heading_count++
+      parked_heading_line[parked_heading_count] = FNR
+      diagnostic_section = "parked"
+      next
+    }
+    if ($0 == session_head) {
+      session_heading_count++
+      session_heading_line[session_heading_count] = FNR
+      diagnostic_section = "session"
+      next
+    }
+    if (/^## /) {
+      if (/^## Parked/ || /^## This session/) {
+        if (mode == "doctor") {
+          store_record("ERROR", "heading-near-miss", ledger_path, FNR, \
+            "replace with the exact required heading", $0)
+        } else if (mode == "tidy-report") {
+          store_record("SKIP", "heading-near-miss", ledger_path, FNR, \
+            "run doctor; tidy never edits headings", $0)
+        }
+      }
+      diagnostic_section = "outside"
+      next
+    }
+
+    classify_item($0)
+    if (diagnostic_kind == "") next
+
+    if (diagnostic_kind == "open") {
+      if (mode == "raw-open") {
+        print $0
+        next
+      }
+      if (mode == "doctor" && diagnostic_section == "outside") {
+        store_record("ERROR", "item-outside-open", ledger_path, FNR, \
+          "move the valid open item under Parked or This session", $0)
+      }
+      if (mode == "tidy-report" || mode == "tidy-rewrite") {
+        if (diagnostic_section == "session") {
+          tidy_action[FNR] = "promote"
+          if (mode == "tidy-report") {
+            store_record("PROMOTE", "open-session", ledger_path, FNR, \
+              "move byte-for-byte from This session to Parked", $0)
+          }
+        } else if (diagnostic_section == "outside") {
+          tidy_action[FNR] = "rehome"
+          if (mode == "tidy-report") {
+            store_record("REHOME", "open-outside", ledger_path, FNR, \
+              "move byte-for-byte from outside known sections to Parked", $0)
+          }
+        }
+      }
+      next
+    }
+
+    if (diagnostic_kind == "done") {
+      if (mode == "doctor" && diagnostic_section == "outside") {
+        store_record("ERROR", "item-outside-done", ledger_path, FNR, \
+          "move the valid done item under a required section", $0)
+      }
+      diagnostic_age = today - parsed_days
+      if ((diagnostic_section == "parked" || diagnostic_section == "session") && \
+          diagnostic_age >= archive_days) {
+        if (mode == "tidy-report") {
+          store_record("ARCHIVE", "done-threshold", ledger_path, FNR, \
+            "append original line to " archive_path "; age " diagnostic_age \
+            "d meets archive threshold " archive_days "d", $0)
+        } else if (mode == "tidy-rewrite") {
+          tidy_action[FNR] = "archive"
+        } else if (mode == "raw-retained") {
+          tidy_action[FNR] = "archive"
+        } else if (mode == "tidy-archive") {
+          print $0
+        }
+      } else if (mode == "tidy-report" && diagnostic_section == "outside") {
+        store_record("SKIP", "done-outside", ledger_path, FNR, \
+          "run doctor; tidy never guesses a section for done items", $0)
+      }
+      next
+    }
+
+    if (diagnostic_kind == "near") {
+      if (mode == "raw-near") {
+        print $0
+      } else if (mode == "doctor") {
+        store_record("ERROR", "item-near-miss-" diagnostic_reason, \
+          ledger_path, FNR, "fix this line by hand; no auto-fix is attempted", $0)
+      } else if (mode == "tidy-report") {
+        store_record("SKIP", "item-near-miss-" diagnostic_reason, \
+          ledger_path, FNR, "run doctor; malformed lines are never touched", $0)
+      }
+      next
+    }
     next
   }
 
@@ -266,6 +543,63 @@ mode == "records" && /^- \[ \]/ {
 
 END {
   if (mode == "date-days") exit date_days_status
+  if (mode == "markers") {
+    for (marker_i = 1; marker_i <= marker_depth; marker_i++) {
+      emit_record("ERROR", "marker-unclosed-begin", marker_path, \
+        marker_begin_line[marker_i], \
+        "restore the missing END or remove the partial managed block", \
+        "FOCUS-LEDGER BEGIN is not closed")
+    }
+    if (marker_block_count > 1) {
+      emit_record("ERROR", "marker-duplicate-block", marker_path, "-", \
+        "keep exactly one balanced FOCUS-LEDGER managed block", \
+        marker_block_count " sequential managed blocks were found")
+    }
+    exit 0
+  }
+  if (diagnostic_mode) {
+    collect_structure_issues()
+    if (mode == "structure-check") exit !structure_valid()
+    if (mode == "raw-retained") {
+      if (!structure_valid()) exit 2
+      for (diagnostic_i = 1; diagnostic_i <= diagnostic_source_count; diagnostic_i++) {
+        if (tidy_action[diagnostic_i] != "archive") print diagnostic_source_line[diagnostic_i]
+      }
+      exit 0
+    }
+    if (mode == "tidy-rewrite") {
+      if (!structure_valid()) exit 2
+      for (diagnostic_i = 1; diagnostic_i <= diagnostic_source_count; diagnostic_i++) {
+        if (diagnostic_i == session_heading_line[1]) {
+          for (move_i = 1; move_i <= diagnostic_source_count; move_i++) {
+            if (tidy_action[move_i] == "promote" || tidy_action[move_i] == "rehome") {
+              print diagnostic_source_line[move_i]
+            }
+          }
+        }
+        if (tidy_action[diagnostic_i] == "archive" || \
+            tidy_action[diagnostic_i] == "promote" || \
+            tidy_action[diagnostic_i] == "rehome") continue
+        print diagnostic_source_line[diagnostic_i]
+      }
+      exit 0
+    }
+    if (mode == "doctor" || mode == "tidy-report") {
+      structure_level = (mode == "doctor") ? "ERROR" : "BLOCK"
+      for (diagnostic_i = 1; diagnostic_i <= heading_issue_count; diagnostic_i++) {
+        emit_record(structure_level, heading_issue_code[diagnostic_i], \
+          ledger_path, heading_issue_line[diagnostic_i], \
+          heading_issue_action[diagnostic_i], heading_issue_detail[diagnostic_i])
+      }
+      for (diagnostic_i = 1; diagnostic_i <= diagnostic_record_count; diagnostic_i++) {
+        emit_record(diagnostic_level[diagnostic_i], \
+          diagnostic_code[diagnostic_i], diagnostic_path[diagnostic_i], \
+          diagnostic_line[diagnostic_i], diagnostic_action[diagnostic_i], \
+          diagnostic_detail[diagnostic_i])
+      }
+    }
+    exit 0
+  }
   if (mode == "park-insert") {
     flush_rewrite_blanks()
     exit !rewrite_done

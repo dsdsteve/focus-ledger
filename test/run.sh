@@ -1528,6 +1528,792 @@ run_native_snooze_check() {
   rm -rf "$native_home"
 }
 
+test_mtime_epoch() {
+  test_mtime_path=$1
+  if test_mtime_value=$(stat -f '%m' "$test_mtime_path" 2>/dev/null) &&
+     case $test_mtime_value in ''|*[!0-9]*) false ;; *) true ;; esac; then
+    printf '%s\n' "$test_mtime_value"
+    return
+  fi
+  if test_mtime_value=$(stat -c '%Y' "$test_mtime_path" 2>/dev/null) &&
+     case $test_mtime_value in ''|*[!0-9]*) false ;; *) true ;; esac; then
+    printf '%s\n' "$test_mtime_value"
+    return
+  fi
+  printf 'unavailable\n'
+}
+
+make_epic4_date_stub() {
+  epic4_dir=$1
+  cat > "$epic4_dir/date" <<'EPIC4_DATE'
+#!/bin/sh
+case $1 in
+  +%s) printf '1700000000\n' ;;
+  +%F) printf '2023-11-14\n' ;;
+  +%Y%m%dT%H%M%S) printf '20231114T221320\n' ;;
+  *) exit 1 ;;
+esac
+EPIC4_DATE
+  chmod +x "$epic4_dir/date"
+}
+
+run_doctor_checks() {
+  sh_bin=$1
+  command -v "$sh_bin" >/dev/null 2>&1 || return
+  doctor_home=$(mktemp -d); doctor_stub=$(mktemp -d); doctor_work=$(mktemp -d)
+  mkdir -p "$doctor_home/.claude"
+  doctor_ledger="$doctor_home/.claude/focus-ledger.md"
+  make_epic4_date_stub "$doctor_stub"
+  doctor_path="$doctor_stub:$PATH"
+
+  sed "s/@TODAY@/$TODAY/" "$FIX/populated.md" > "$doctor_ledger"
+  cat > "$doctor_work/CLAUDE.md" <<'DOCTOR_LOCAL'
+user content
+<!-- FOCUS-LEDGER:BEGIN -->
+managed
+<!-- FOCUS-LEDGER:END -->
+DOCTOR_LOCAL
+  cat > "$doctor_home/.claude/CLAUDE.md" <<'DOCTOR_GLOBAL'
+<!-- FOCUS-LEDGER:BEGIN -->
+global managed
+<!-- FOCUS-LEDGER:END -->
+DOCTOR_GLOBAL
+  doctor_ledger_sum=$(cksum < "$doctor_ledger"); doctor_ledger_mtime=$(test_mtime_epoch "$doctor_ledger")
+  doctor_local_sum=$(cksum < "$doctor_work/CLAUDE.md"); doctor_local_mtime=$(test_mtime_epoch "$doctor_work/CLAUDE.md")
+  doctor_global_sum=$(cksum < "$doctor_home/.claude/CLAUDE.md"); doctor_global_mtime=$(test_mtime_epoch "$doctor_home/.claude/CLAUDE.md")
+  (cd "$doctor_work" && env -i HOME="$doctor_home" PATH="$doctor_path" "$sh_bin" \
+    "$ROOT/scripts/focus-doctor.sh" > "$doctor_home/clean.out" 2> "$doctor_home/clean.err"); doctor_rc=$?
+  {
+    printf 'META\tdoctor\t%s\t-\tread-only format-v1 diagnostics\toutput fields: level, code, path, line, action, detail\n' "$doctor_ledger"
+    if command -v jq >/dev/null 2>&1; then
+      printf 'INFO\tjq\t-\t-\tno action needed\tjq is available (optional)\n'
+    else
+      printf 'INFO\tjq\t-\t-\tno action needed\tjq is unavailable; built-in fallbacks remain supported\n'
+    fi
+    printf 'OK\tall-clean\t%s\t-\tno action needed\tall checked ledger and setup contracts are clean\n' "$doctor_ledger"
+  } > "$doctor_home/clean.expected"
+  doctor_ok=1; doctor_why=""
+  [ "$doctor_rc" = 0 ] && cmp -s "$doctor_home/clean.out" "$doctor_home/clean.expected" &&
+    [ ! -s "$doctor_home/clean.err" ] || { doctor_ok=0; doctor_why="rc=$doctor_rc or exact clean output differs"; }
+  report_case "$sh_bin" "doctor: pristine state has exact all-clean contract" "$doctor_ok" "$doctor_why"
+
+  doctor_ok=1; doctor_why=""
+  [ "$(cksum < "$doctor_ledger")" = "$doctor_ledger_sum" ] &&
+    [ "$(test_mtime_epoch "$doctor_ledger")" = "$doctor_ledger_mtime" ] &&
+    [ "$(cksum < "$doctor_work/CLAUDE.md")" = "$doctor_local_sum" ] &&
+    [ "$(test_mtime_epoch "$doctor_work/CLAUDE.md")" = "$doctor_local_mtime" ] &&
+    [ "$(cksum < "$doctor_home/.claude/CLAUDE.md")" = "$doctor_global_sum" ] &&
+    [ "$(test_mtime_epoch "$doctor_home/.claude/CLAUDE.md")" = "$doctor_global_mtime" ] || {
+      doctor_ok=0; doctor_why="doctor changed bytes or mtime"
+    }
+  report_case "$sh_bin" "doctor: all inspected files remain byte/mtime identical" "$doctor_ok" "$doctor_why"
+
+  cp "$FIX/doctor-broken.md" "$doctor_ledger"; cp "$doctor_ledger" "$doctor_home/broken.before"
+  (cd "$doctor_work" && env -i HOME="$doctor_home" PATH="$doctor_path" "$sh_bin" \
+    "$ROOT/scripts/focus-doctor.sh" > "$doctor_home/broken.out" 2> "$doctor_home/broken.err"); doctor_rc=$?
+  doctor_ok=1; doctor_why=""
+  [ "$doctor_rc" = 1 ] && cmp -s "$doctor_ledger" "$doctor_home/broken.before" || {
+    doctor_ok=0; doctor_why="rc=$doctor_rc or broken ledger changed"
+  }
+  for doctor_code_line in \
+    'heading-duplicate-parked	.\+	10	' \
+    'heading-out-of-order	.\+	2	' \
+    'item-near-miss-checkbox-empty	.\+	5	' \
+    'item-near-miss-checkbox-spacing	.\+	6	' \
+    'item-near-miss-missing-date	.\+	7	' \
+    'item-near-miss-impossible-date	.\+	8	' \
+    'item-near-miss-malformed-date	.\+	9	' \
+    'item-outside-open	.\+	12	' \
+    'item-outside-done	.\+	13	' \
+    'item-near-miss-leading-indentation	.\+	15	' \
+    'item-near-miss-bullet-shape	.\+	16	' \
+    'item-near-miss-checkbox-shape	.\+	17	'; do
+    grep "$doctor_code_line" "$doctor_home/broken.out" >/dev/null || {
+      doctor_ok=0; doctor_why="$doctor_why; missing $doctor_code_line"
+    }
+  done
+  grep -qF 'commented near miss' "$doctor_home/broken.out" && {
+    doctor_ok=0; doctor_why="$doctor_why; commented example leaked"
+  }
+  report_case "$sh_bin" "doctor: every ledger heading/item finding has its source line" "$doctor_ok" "$doctor_why"
+
+  printf '# Focus ledger\n' > "$doctor_ledger"
+  (cd "$doctor_work" && env -i HOME="$doctor_home" PATH="$doctor_path" "$sh_bin" \
+    "$ROOT/scripts/focus-doctor.sh" > "$doctor_home/missing-head.out" 2> "$doctor_home/missing-head.err"); doctor_rc=$?
+  doctor_ok=1; doctor_why=""
+  [ "$doctor_rc" = 1 ] && grep -qF $'heading-missing-parked\t' "$doctor_home/missing-head.out" &&
+    grep -qF $'heading-missing-session\t' "$doctor_home/missing-head.out" || {
+      doctor_ok=0; doctor_why="missing headings were not reported (rc=$doctor_rc)"
+    }
+  report_case "$sh_bin" "doctor: each required missing heading is actionable" "$doctor_ok" "$doctor_why"
+
+  sed "s/@TODAY@/$TODAY/" "$FIX/populated.md" > "$doctor_ledger"
+  cat > "$doctor_work/CLAUDE.md" <<'DOCTOR_UNCLOSED'
+local user content
+<!-- FOCUS-LEDGER:BEGIN -->
+unclosed
+DOCTOR_UNCLOSED
+  cat > "$doctor_home/.claude/CLAUDE.md" <<'DOCTOR_NESTED'
+<!-- FOCUS-LEDGER:END -->
+<!-- FOCUS-LEDGER:BEGIN -->
+<!-- FOCUS-LEDGER:BEGIN -->
+<!-- FOCUS-LEDGER:END -->
+<!-- FOCUS-LEDGER:END -->
+<!-- FOCUS-LEDGER:BEGIN -->
+<!-- FOCUS-LEDGER:END -->
+DOCTOR_NESTED
+  touch -t 200001010000 "$doctor_work/CLAUDE.md" "$doctor_home/.claude/CLAUDE.md"
+  doctor_unclosed_sum=$(cksum < "$doctor_work/CLAUDE.md"); doctor_unclosed_mtime=$(test_mtime_epoch "$doctor_work/CLAUDE.md")
+  doctor_nested_sum=$(cksum < "$doctor_home/.claude/CLAUDE.md"); doctor_nested_mtime=$(test_mtime_epoch "$doctor_home/.claude/CLAUDE.md")
+  (cd "$doctor_work" && env -i HOME="$doctor_home" PATH="$doctor_path" "$sh_bin" \
+    "$ROOT/scripts/focus-doctor.sh" > "$doctor_home/markers.out" 2> "$doctor_home/markers.err"); doctor_rc=$?
+  doctor_ok=1; doctor_why=""
+  [ "$doctor_rc" = 1 ] &&
+    grep -qF $'marker-unclosed-begin\t' "$doctor_home/markers.out" &&
+    grep -qF $'marker-unmatched-end\t' "$doctor_home/markers.out" &&
+    grep -qF $'marker-nested-begin\t' "$doctor_home/markers.out" &&
+    grep -qF $'marker-duplicate-block\t' "$doctor_home/markers.out" || {
+      doctor_ok=0; doctor_why="local/global unbalanced marker classes missing (rc=$doctor_rc)"
+    }
+  grep -qF $'marker-unclosed-begin\t' "$doctor_home/markers.out" &&
+    grep -qF $'2\trestore the missing END' "$doctor_home/markers.out" || {
+      doctor_ok=0; doctor_why="$doctor_why; marker source line missing"
+    }
+  [ "$(cksum < "$doctor_work/CLAUDE.md")" = "$doctor_unclosed_sum" ] &&
+    [ "$(test_mtime_epoch "$doctor_work/CLAUDE.md")" = "$doctor_unclosed_mtime" ] &&
+    [ "$(cksum < "$doctor_home/.claude/CLAUDE.md")" = "$doctor_nested_sum" ] &&
+    [ "$(test_mtime_epoch "$doctor_home/.claude/CLAUDE.md")" = "$doctor_nested_mtime" ] || {
+      doctor_ok=0; doctor_why="$doctor_why; finding path changed CLAUDE.md bytes or mtime"
+    }
+  report_case "$sh_bin" "doctor: local/global unmatched, nested, and unclosed markers" "$doctor_ok" "$doctor_why"
+
+  rm -f "$doctor_work/CLAUDE.md" "$doctor_home/.claude/CLAUDE.md"
+  mkdir "$doctor_ledger.lock" "$doctor_ledger.lock.reap"
+  printf 'lock.%s\n' "$$" > "$doctor_ledger.lock/owner"
+  printf 'reap.999999999\n' > "$doctor_ledger.lock.reap/owner"
+  (cd "$doctor_work" && env -i HOME="$doctor_home" PATH="$doctor_path" "$sh_bin" \
+    "$ROOT/scripts/focus-doctor.sh" > "$doctor_home/locks.out" 2> "$doctor_home/locks.err"); doctor_rc=$?
+  doctor_ok=1; doctor_why=""
+  [ "$doctor_rc" = 1 ] && grep -qF $'ledger-lock-active\t' "$doctor_home/locks.out" &&
+    grep -qF $'ledger-reap-stale\t' "$doctor_home/locks.out" &&
+    [ -d "$doctor_ledger.lock" ] && [ -d "$doctor_ledger.lock.reap" ] || {
+      doctor_ok=0; doctor_why="lock owner state wrong or doctor removed a lock (rc=$doctor_rc)"
+    }
+  report_case "$sh_bin" "doctor: active owner differs from stale lock and neither is removed" "$doctor_ok" "$doctor_why"
+  rm -f "$doctor_ledger.lock/owner" "$doctor_ledger.lock.reap/owner"; rmdir "$doctor_ledger.lock" "$doctor_ledger.lock.reap"
+
+  printf '1699999999\n' > "$doctor_home/.claude/.focus-snooze"
+  printf 'not-an-epoch\n' > "$doctor_home/.claude/.focus-last-nudge"
+  doctor_stale_temp="$doctor_ledger.ABC123"; doctor_fresh_temp="$doctor_ledger.DEF456"
+  doctor_link_temp="$doctor_ledger.GHI789"; doctor_fifo_temp="$doctor_ledger.JKL012"
+  printf 'stale temp\n' > "$doctor_stale_temp"; touch -t 200001010000 "$doctor_stale_temp"
+  printf 'fresh temp\n' > "$doctor_fresh_temp"
+  ln -s "$doctor_stale_temp" "$doctor_link_temp"; mkfifo "$doctor_fifo_temp"
+  touch -t 200001010000 "$doctor_home/.claude/.focus-snooze" "$doctor_home/.claude/.focus-last-nudge"
+  doctor_snooze_sum=$(cksum < "$doctor_home/.claude/.focus-snooze"); doctor_snooze_mtime=$(test_mtime_epoch "$doctor_home/.claude/.focus-snooze")
+  doctor_nudge_sum=$(cksum < "$doctor_home/.claude/.focus-last-nudge"); doctor_nudge_mtime=$(test_mtime_epoch "$doctor_home/.claude/.focus-last-nudge")
+  doctor_stale_sum=$(cksum < "$doctor_stale_temp"); doctor_stale_mtime=$(test_mtime_epoch "$doctor_stale_temp")
+  (cd "$doctor_work" && env -i HOME="$doctor_home" PATH="$doctor_path" "$sh_bin" \
+    "$ROOT/scripts/focus-doctor.sh" > "$doctor_home/artifacts.out" 2> "$doctor_home/artifacts.err"); doctor_rc=$?
+  doctor_ok=1; doctor_why=""
+  [ "$doctor_rc" = 1 ] && grep -qF $'snooze-expired\t' "$doctor_home/artifacts.out" &&
+    grep -qF $'last-nudge-malformed\t' "$doctor_home/artifacts.out" &&
+    grep -qF $'temp-stale\t' "$doctor_home/artifacts.out" &&
+    grep -qF $'temp-leftover\t' "$doctor_home/artifacts.out" &&
+    [ "$(grep -cF $'temp-unsafe\t' "$doctor_home/artifacts.out")" = 2 ] &&
+    [ "$(cksum < "$doctor_home/.claude/.focus-snooze")" = "$doctor_snooze_sum" ] &&
+    [ "$(test_mtime_epoch "$doctor_home/.claude/.focus-snooze")" = "$doctor_snooze_mtime" ] &&
+    [ "$(cksum < "$doctor_home/.claude/.focus-last-nudge")" = "$doctor_nudge_sum" ] &&
+    [ "$(test_mtime_epoch "$doctor_home/.claude/.focus-last-nudge")" = "$doctor_nudge_mtime" ] &&
+    [ "$(cksum < "$doctor_stale_temp")" = "$doctor_stale_sum" ] &&
+    [ "$(test_mtime_epoch "$doctor_stale_temp")" = "$doctor_stale_mtime" ] &&
+    [ -e "$doctor_stale_temp" ] && [ -e "$doctor_fresh_temp" ] &&
+    [ -L "$doctor_link_temp" ] && [ -p "$doctor_fifo_temp" ] || {
+      doctor_ok=0; doctor_why="marker/temp classes missing or doctor changed artifacts (rc=$doctor_rc)"
+    }
+  report_case "$sh_bin" "doctor: expired/malformed markers and safe/unsafe temp classes" "$doctor_ok" "$doctor_why"
+  rm -f "$doctor_home/.claude/.focus-snooze" "$doctor_home/.claude/.focus-last-nudge" \
+    "$doctor_stale_temp" "$doctor_fresh_temp" "$doctor_link_temp" "$doctor_fifo_temp"
+
+  rm -f "$doctor_ledger"
+  missing_home=$(mktemp -d); missing_work=$(mktemp -d)
+  (cd "$missing_work" && env -i HOME="$missing_home" PATH="$doctor_path" "$sh_bin" \
+    "$ROOT/scripts/focus-doctor.sh" > "$missing_home/out" 2> "$missing_home/err"); doctor_rc=$?
+  doctor_ok=1; doctor_why=""
+  [ "$doctor_rc" = 0 ] && grep -qF $'INFO\tledger-missing\t' "$missing_home/out" &&
+    [ ! -e "$missing_home/.claude" ] || {
+      doctor_ok=0; doctor_why="missing ledger was not clean/no-create (rc=$doctor_rc)"
+    }
+  report_case "$sh_bin" "doctor: missing ledger is informational rc0 and creates nothing" "$doctor_ok" "$doctor_why"
+  rm -rf "$missing_home" "$missing_work"
+
+  partial_root=$(mktemp -d); mkdir -p "$partial_root/scripts"
+  cp "$ROOT/scripts/focus-doctor.sh" "$ROOT/scripts/focus-lib.sh" "$partial_root/scripts/"
+  sed "s/@TODAY@/$TODAY/" "$FIX/populated.md" > "$doctor_ledger"
+  (cd "$doctor_work" && env -i HOME="$doctor_home" PATH="$doctor_path" "$sh_bin" \
+    "$partial_root/scripts/focus-doctor.sh" > "$doctor_home/operational.out" 2> "$doctor_home/operational.err"); doctor_rc=$?
+  doctor_ok=1; doctor_why=""
+  [ "$doctor_rc" = 2 ] && grep -qF $'ledger-parser-failed\t' "$doctor_home/operational.out" || {
+    doctor_ok=0; doctor_why="parser failure did not return rc2 (rc=$doctor_rc)"
+  }
+  report_case "$sh_bin" "doctor: operational parser failure is rc2, never clean" "$doctor_ok" "$doctor_why"
+  rm -rf "$partial_root" "$doctor_home" "$doctor_stub" "$doctor_work"
+}
+
+run_tidy_report_checks() {
+  sh_bin=$1
+  command -v "$sh_bin" >/dev/null 2>&1 || return
+  tidy_home=$(mktemp -d); tidy_stub=$(mktemp -d); mkdir -p "$tidy_home/.claude"
+  tidy_ledger="$tidy_home/.claude/focus-ledger.md"
+  tidy_archive="$tidy_home/.claude/focus-ledger-archive.md"
+  make_epic4_date_stub "$tidy_stub"
+  tidy_path="$tidy_stub:$PATH"
+
+  cp "$FIX/tidy-mixed.md" "$tidy_ledger"; touch -t 202001010000 "$tidy_ledger"
+  tidy_sum=$(cksum < "$tidy_ledger"); tidy_mtime=$(test_mtime_epoch "$tidy_ledger")
+  env -i HOME="$tidy_home" PATH="$tidy_path" "$sh_bin" "$ROOT/scripts/focus-tidy.sh" \
+    > "$tidy_home/report.out" 2> "$tidy_home/report.err"; tidy_rc=$?
+  {
+    printf 'META\treport\t%s\t-\treport-only; archive threshold 30d\tno files, locks, or mtimes are changed\n' "$tidy_ledger"
+    printf 'REHOME\topen-outside\t%s\t3\tmove byte-for-byte from outside known sections to Parked\t- [ ] (2023-11-13) fallback outside item\n' "$tidy_ledger"
+    printf 'ARCHIVE\tdone-threshold\t%s\t7\tappend original line to %s; age 30d meets archive threshold 30d\t- [x] (2023-10-15) threshold done item\n' "$tidy_ledger" "$tidy_archive"
+    printf 'SKIP\titem-near-miss-checkbox-empty\t%s\t9\trun doctor; malformed lines are never touched\t- [] near miss stays here\n' "$tidy_ledger"
+    printf 'PROMOTE\topen-session\t%s\t12\tmove byte-for-byte from This session to Parked\t- [ ] (2023-11-01) duplicate open item\n' "$tidy_ledger"
+    printf 'ARCHIVE\tdone-threshold\t%s\t13\tappend original line to %s; age 45d meets archive threshold 30d\t- [x] (2023-09-30) old session done item\n' "$tidy_ledger" "$tidy_archive"
+    printf 'REHOME\topen-outside\t%s\t17\tmove byte-for-byte from outside known sections to Parked\t- [ ] (2023-11-14) outside notes item\n' "$tidy_ledger"
+    printf 'SKIP\tdone-outside\t%s\t18\trun doctor; tidy never guesses a section for done items\t- [x] (2023-09-01) done outside stays\n' "$tidy_ledger"
+    printf 'SUMMARY\tcounts\t%s\t-\tarchive=2;promote=1;rehome=2;remove=0\tskip=2;block=0\n' "$tidy_ledger"
+  } > "$tidy_home/report.expected"
+  tidy_ok=1; tidy_why=""
+  [ "$tidy_rc" = 0 ] && cmp -s "$tidy_home/report.out" "$tidy_home/report.expected" &&
+    [ ! -s "$tidy_home/report.err" ] &&
+    [ "$(cksum < "$tidy_ledger")" = "$tidy_sum" ] &&
+    [ "$(test_mtime_epoch "$tidy_ledger")" = "$tidy_mtime" ] &&
+    [ ! -e "$tidy_archive" ] && [ ! -e "$tidy_ledger.lock" ] || {
+      tidy_ok=0; tidy_why="rc=$tidy_rc, report differs, or report mode touched state"
+    }
+  report_case "$sh_bin" "tidy report: exact mixed-state ordering and strict no-touch" "$tidy_ok" "$tidy_why"
+
+  env -i HOME="$tidy_home" PATH="$tidy_path" FOCUS_ARCHIVE_DAYS=bogus "$sh_bin" \
+    "$ROOT/scripts/focus-tidy.sh" > "$tidy_home/invalid.out" 2> "$tidy_home/invalid.err"; invalid_rc=$?
+  env -i HOME="$tidy_home" PATH="$tidy_path" FOCUS_ARCHIVE_DAYS=31 "$sh_bin" \
+    "$ROOT/scripts/focus-tidy.sh" > "$tidy_home/31.out" 2> "$tidy_home/31.err"; thirtyone_rc=$?
+  env -i HOME="$tidy_home" PATH="$tidy_path" FOCUS_ARCHIVE_DAYS=0 "$sh_bin" \
+    "$ROOT/scripts/focus-tidy.sh" > "$tidy_home/zero.out" 2> "$tidy_home/zero.err"; zero_rc=$?
+  tidy_ok=1; tidy_why=""
+  [ "$invalid_rc" = 0 ] && cmp -s "$tidy_home/invalid.out" "$tidy_home/report.expected" || {
+    tidy_ok=0; tidy_why="invalid threshold did not safely default to 30"
+  }
+  [ "$thirtyone_rc" = 0 ] && grep -qF $'archive=1;promote=1;rehome=2;remove=0' "$tidy_home/31.out" &&
+    ! grep -qF 'threshold done item' "$tidy_home/31.out" || {
+      tidy_ok=0; tidy_why="$tidy_why; age==30 boundary archived at threshold 31"
+    }
+  [ "$zero_rc" = 0 ] && grep -qF $'archive=4;promote=1;rehome=2;remove=0' "$tidy_home/zero.out" || {
+    tidy_ok=0; tidy_why="$tidy_why; nonnegative zero threshold did not archive all known-section done lines"
+  }
+  report_case "$sh_bin" "tidy report: archive threshold boundaries and invalid fallback" "$tidy_ok" "$tidy_why"
+
+  sed "s/@TODAY@/$TODAY/" "$FIX/populated.md" > "$tidy_ledger"; touch -t 202001010000 "$tidy_ledger"
+  printf '1699999999\n' > "$tidy_home/.claude/.focus-snooze"
+  printf '1699999998\n' > "$tidy_home/.claude/.focus-last-nudge"
+  tidy_temp="$tidy_ledger.tmp.999999999.ABC123"; printf 'stale temp\n' > "$tidy_temp"; touch -t 200001010000 "$tidy_temp"
+  marker_sum=$(cksum < "$tidy_home/.claude/.focus-snooze"); marker_mtime=$(test_mtime_epoch "$tidy_home/.claude/.focus-snooze")
+  nudge_sum=$(cksum < "$tidy_home/.claude/.focus-last-nudge"); nudge_mtime=$(test_mtime_epoch "$tidy_home/.claude/.focus-last-nudge")
+  artifact_ledger_sum=$(cksum < "$tidy_ledger"); artifact_ledger_mtime=$(test_mtime_epoch "$tidy_ledger")
+  temp_sum=$(cksum < "$tidy_temp"); temp_mtime=$(test_mtime_epoch "$tidy_temp")
+  env -i HOME="$tidy_home" PATH="$tidy_path" "$sh_bin" "$ROOT/scripts/focus-tidy.sh" \
+    > "$tidy_home/artifact-report.out" 2> "$tidy_home/artifact-report.err"; tidy_rc=$?
+  {
+    printf 'META\treport\t%s\t-\treport-only; archive threshold 30d\tno files, locks, or mtimes are changed\n' "$tidy_ledger"
+    printf 'REMOVE\tsnooze-expired\t%s\t-\tremove expired numeric marker after core publication verifies\tmarker epoch 1699999999 is not later than current epoch 1700000000\n' "$tidy_home/.claude/.focus-snooze"
+    printf 'REMOVE\tlast-nudge-expired\t%s\t-\tremove expired numeric marker after core publication verifies\tmarker epoch 1699999998 is not later than current epoch 1700000000\n' "$tidy_home/.claude/.focus-last-nudge"
+    printf 'REMOVE\ttemp-stale\t%s\t-\tremove safe stale regular temp after core publication verifies\ttemp mtime %s is at least 86400 seconds old\n' "$tidy_temp" "$temp_mtime"
+    printf 'SUMMARY\tcounts\t%s\t-\tarchive=0;promote=0;rehome=0;remove=3\tskip=0;block=0\n' "$tidy_ledger"
+  } > "$tidy_home/artifact-report.expected"
+  tidy_ok=1; tidy_why=""
+  [ "$tidy_rc" = 0 ] && cmp -s "$tidy_home/artifact-report.out" "$tidy_home/artifact-report.expected" &&
+    [ "$(cksum < "$tidy_home/.claude/.focus-snooze")" = "$marker_sum" ] &&
+    [ "$(test_mtime_epoch "$tidy_home/.claude/.focus-snooze")" = "$marker_mtime" ] &&
+    [ "$(cksum < "$tidy_home/.claude/.focus-last-nudge")" = "$nudge_sum" ] &&
+    [ "$(test_mtime_epoch "$tidy_home/.claude/.focus-last-nudge")" = "$nudge_mtime" ] &&
+    [ "$(cksum < "$tidy_ledger")" = "$artifact_ledger_sum" ] &&
+    [ "$(test_mtime_epoch "$tidy_ledger")" = "$artifact_ledger_mtime" ] &&
+    [ "$(cksum < "$tidy_temp")" = "$temp_sum" ] &&
+    [ "$(test_mtime_epoch "$tidy_temp")" = "$temp_mtime" ] || {
+      tidy_ok=0; tidy_why="artifact report differs or touched marker/temp (rc=$tidy_rc)"
+    }
+  report_case "$sh_bin" "tidy report: exact expired-marker/stale-temp report is no-touch" "$tidy_ok" "$tidy_why"
+
+  rm -rf "$tidy_home" "$tidy_stub"
+}
+
+run_tidy_apply_checks() {
+  sh_bin=$1
+  command -v "$sh_bin" >/dev/null 2>&1 || return
+  apply_home=$(mktemp -d); apply_stub=$(mktemp -d); mkdir -p "$apply_home/.claude"
+  apply_ledger="$apply_home/.claude/focus-ledger.md"
+  apply_archive="$apply_home/.claude/focus-ledger-archive.md"
+  make_epic4_date_stub "$apply_stub"
+  apply_path="$apply_stub:$PATH"
+
+  cp "$FIX/tidy-mixed.md" "$apply_ledger"; cp "$apply_ledger" "$apply_home/original-ledger"
+  printf '# Existing archive\nprior entry\n' > "$apply_archive"
+  env -i HOME="$apply_home" PATH="$apply_path" "$sh_bin" "$ROOT/scripts/focus-tidy.sh" --apply \
+    > "$apply_home/apply.out" 2> "$apply_home/apply.err"; apply_rc=$?
+  cat > "$apply_home/ledger.expected" <<'APPLY_LEDGER'
+# Focus ledger
+
+
+## Parked (durable — carries across sessions)
+- [ ] (2023-11-01) duplicate open item
+- [x] (2023-10-16) fresh parked done item
+- [] near miss stays here
+
+- [ ] (2023-11-13) fallback outside item
+- [ ] (2023-11-01) duplicate open item
+- [ ] (2023-11-14) outside notes item
+## This session (volatile — clear whenever)
+- [x] (2023-10-16) fresh session done item
+
+## Notes
+- [x] (2023-09-01) done outside stays
+APPLY_LEDGER
+  cat > "$apply_home/archive.expected" <<'APPLY_ARCHIVE'
+# Existing archive
+prior entry
+
+## Archived by focus-ledger tidy on 2023-11-14 (epoch 1700000000)
+
+- [x] (2023-10-15) threshold done item
+- [x] (2023-09-30) old session done item
+APPLY_ARCHIVE
+  set -- "$apply_ledger".backup.*; apply_backup=$1
+  {
+    printf 'APPLY\tverified\t%s\t-\tarchive=2;promote=1;rehome=2;remove=0\tpost-verify passed with exact open/near-miss/retained-record multisets; recovery backup=%s\n' \
+      "$apply_ledger" "$apply_backup"
+  } > "$apply_home/apply.expected"
+  apply_ok=1; apply_why=""
+  [ "$apply_rc" = 0 ] && cmp -s "$apply_home/apply.out" "$apply_home/apply.expected" &&
+    [ ! -s "$apply_home/apply.err" ] && cmp -s "$apply_ledger" "$apply_home/ledger.expected" &&
+    cmp -s "$apply_archive" "$apply_home/archive.expected" &&
+    [ -f "$apply_backup" ] && cmp -s "$apply_backup" "$apply_home/original-ledger" &&
+    [ "$(grep -cF -- '- [ ] (2023-11-01) duplicate open item' "$apply_ledger")" = 2 ] || {
+      apply_ok=0; apply_why="rc=$apply_rc, exact output/files differ, backup invalid, or duplicate multiset lost"
+    }
+  set -- "$apply_archive".backup.*
+  [ ! -e "$1" ] || { apply_ok=0; apply_why="$apply_why; archive transaction backup leaked"; }
+  report_case "$sh_bin" "tidy apply: exact archive/promote/rehome, duplicate multiset, and backup" "$apply_ok" "$apply_why"
+
+  rm -f "$apply_archive" "$apply_ledger".backup.*
+  cat > "$apply_ledger" <<'DUPLICATE_ARCHIVE_LEDGER'
+# Focus ledger
+
+## Parked (durable — carries across sessions)
+- [x] (2023-10-01) duplicate done occurrence
+
+## This session (volatile — clear whenever)
+- [x] (2023-10-01) duplicate done occurrence
+
+## Notes
+- [ ] (2023-11-14) fallback EOF occurrence
+DUPLICATE_ARCHIVE_LEDGER
+  env -i HOME="$apply_home" PATH="$apply_path" "$sh_bin" "$ROOT/scripts/focus-tidy.sh" --apply \
+    > "$apply_home/duplicate-archive.out" 2> "$apply_home/duplicate-archive.err"; duplicate_archive_rc=$?
+  apply_ok=1; apply_why=""
+  [ "$duplicate_archive_rc" = 0 ] &&
+    [ "$(grep -cF -- '- [x] (2023-10-01) duplicate done occurrence' "$apply_archive")" = 2 ] &&
+    [ "$(grep -cF -- '- [ ] (2023-11-14) fallback EOF occurrence' "$apply_ledger")" = 1 ] &&
+    awk '/^## Parked/{parked=1; next} /^## This session/{exit} parked && /fallback EOF occurrence/{found=1} END{exit !found}' "$apply_ledger" || {
+      apply_ok=0; apply_why="duplicate archived occurrences or EOF fallback re-home was lost"
+    }
+  report_case "$sh_bin" "tidy apply: duplicate archive occurrences and fallback EOF re-home" "$apply_ok" "$apply_why"
+
+  rm -f "$apply_archive" "$apply_ledger".backup.*
+  cp "$FIX/tidy-mixed.md" "$apply_ledger"
+  printf '1699999999\n' > "$apply_home/.claude/.focus-snooze"
+  printf '1699999998\n' > "$apply_home/.claude/.focus-last-nudge"
+  apply_temp="$apply_ledger.tmp.999999999.ABC123"; printf 'old temp\n' > "$apply_temp"; touch -t 200001010000 "$apply_temp"
+  manual_temp="$apply_ledger.MANUAL"; printf 'user recovery\n' > "$manual_temp"; touch -t 200001010000 "$manual_temp"
+  env -i HOME="$apply_home" PATH="$apply_path" "$sh_bin" "$ROOT/scripts/focus-tidy.sh" --apply \
+    > "$apply_home/cleanup.out" 2> "$apply_home/cleanup.err"; cleanup_rc=$?
+  apply_ok=1; apply_why=""
+  set -- "$apply_temp".tidy-delete.*
+  [ "$cleanup_rc" = 0 ] && grep -qF $'archive=2;promote=1;rehome=2;remove=3\t' "$apply_home/cleanup.out" &&
+    [ ! -e "$apply_home/.claude/.focus-snooze" ] &&
+    [ ! -e "$apply_home/.claude/.focus-last-nudge" ] && [ ! -e "$apply_temp" ] &&
+    [ -f "$manual_temp" ] && [ "$(cat "$manual_temp")" = 'user recovery' ] &&
+    [ ! -e "$1" ] || {
+      apply_ok=0; apply_why="cleanup did not occur after successful verification (rc=$cleanup_rc)"
+    }
+  report_case "$sh_bin" "tidy apply: expired markers and safe temp removed after core verify" "$apply_ok" "$apply_why"
+  rm -f "$manual_temp"
+
+  noop_home=$(mktemp -d)
+  noop_ledger="$noop_home/.claude/focus-ledger.md"
+  env -i HOME="$noop_home" PATH="$apply_path" "$sh_bin" "$ROOT/scripts/focus-tidy.sh" \
+    > "$noop_home/missing-report.out" 2> "$noop_home/missing-report.err"; missing_report_rc=$?
+  env -i HOME="$noop_home" PATH="$apply_path" "$sh_bin" "$ROOT/scripts/focus-tidy.sh" --apply \
+    > "$noop_home/missing-apply.out" 2> "$noop_home/missing-apply.err"; missing_apply_rc=$?
+  {
+    printf 'META\treport\t%s\t-\treport-only; archive threshold 30d\tno files, locks, or mtimes are changed\n' "$noop_ledger"
+    printf 'NOTHING\tno-actions\t%s\t-\tno tidy actions\tmissing, empty, already tidy, or doctor-only lines require no automatic change\n' "$noop_ledger"
+    printf 'SUMMARY\tcounts\t%s\t-\tarchive=0;promote=0;rehome=0;remove=0\tskip=0;block=0\n' "$noop_ledger"
+  } > "$noop_home/noop-report.expected"
+  printf 'APPLY\tno-op\t%s\t-\tno mutation performed\tledger is missing; no backup or other file was created\n' "$noop_ledger" > "$noop_home/missing-apply.expected"
+  apply_ok=1; apply_why=""
+  [ "$missing_report_rc" = 0 ] && [ "$missing_apply_rc" = 0 ] &&
+    cmp -s "$noop_home/missing-report.out" "$noop_home/noop-report.expected" &&
+    cmp -s "$noop_home/missing-apply.out" "$noop_home/missing-apply.expected" &&
+    [ ! -s "$noop_home/missing-report.err" ] && [ ! -s "$noop_home/missing-apply.err" ] &&
+    [ ! -e "$noop_home/.claude" ] || {
+      apply_ok=0; apply_why="missing report/apply created state or exact contract differs"
+    }
+  mkdir -p "$noop_home/.claude"; : > "$noop_ledger"
+  empty_mtime=$(test_mtime_epoch "$noop_ledger")
+  env -i HOME="$noop_home" PATH="$apply_path" "$sh_bin" "$ROOT/scripts/focus-tidy.sh" \
+    > "$noop_home/empty-report.out" 2> "$noop_home/empty-report.err"; empty_report_rc=$?
+  env -i HOME="$noop_home" PATH="$apply_path" "$sh_bin" "$ROOT/scripts/focus-tidy.sh" --apply \
+    > "$noop_home/empty-apply.out" 2> "$noop_home/empty-apply.err"; empty_rc=$?
+  printf 'APPLY\tno-op\t%s\t-\tno mutation performed\tledger is empty; no backup or other file was created\n' "$noop_ledger" > "$noop_home/empty-apply.expected"
+  set -- "$noop_ledger".backup.*
+  [ "$empty_report_rc" = 0 ] && [ "$empty_rc" = 0 ] &&
+    cmp -s "$noop_home/empty-report.out" "$noop_home/noop-report.expected" &&
+    cmp -s "$noop_home/empty-apply.out" "$noop_home/empty-apply.expected" &&
+    [ ! -s "$noop_home/empty-report.err" ] && [ ! -s "$noop_home/empty-apply.err" ] &&
+    [ ! -e "$1" ] && [ "$(test_mtime_epoch "$noop_ledger")" = "$empty_mtime" ] || {
+      apply_ok=0; apply_why="$apply_why; empty report/apply changed state or exact contract"
+    }
+  report_case "$sh_bin" "tidy: missing/empty report and apply exact no-create/no-backup rc0" "$apply_ok" "$apply_why"
+  rm -rf "$noop_home"
+
+  rm -f "$apply_archive" "$apply_ledger".backup.*
+  cp "$FIX/tidy-mixed.md" "$apply_ledger"
+  env -i HOME="$apply_home" PATH="$apply_path" "$sh_bin" "$ROOT/scripts/focus-tidy.sh" \
+    > "$apply_home/before-park.report" 2> "$apply_home/before-park.err"; before_report_rc=$?
+  env -i HOME="$apply_home" PATH="$apply_path" "$sh_bin" "$ROOT/scripts/focus-park.sh" \
+    'added between report and apply' > "$apply_home/between-park.out" 2> "$apply_home/between-park.err"; between_park_rc=$?
+  env -i HOME="$apply_home" PATH="$apply_path" "$sh_bin" "$ROOT/scripts/focus-tidy.sh" --apply \
+    > "$apply_home/rederive.out" 2> "$apply_home/rederive.err"; rederive_rc=$?
+  set -- "$apply_ledger".backup.*; rederive_backup=$1
+  apply_ok=1; apply_why=""
+  [ "$before_report_rc" = 0 ] && [ "$between_park_rc" = 0 ] && [ "$rederive_rc" = 0 ] &&
+    [ "$(grep -cF 'added between report and apply' "$apply_ledger")" = 1 ] &&
+    [ "$(grep -cF 'added between report and apply' "$rederive_backup")" = 1 ] || {
+      apply_ok=0; apply_why="apply trusted stale report or lost intervening park"
+    }
+  report_case "$sh_bin" "tidy apply: fresh in-lock derivation preserves a park after report" "$apply_ok" "$apply_why"
+
+  rm -f "$apply_ledger".backup.* "$apply_archive"
+  sed "s/@TODAY@/$TODAY/" "$FIX/populated.md" > "$apply_ledger"
+  env -i HOME="$apply_home" PATH="$apply_path" CLAUDE_PLUGIN_ROOT="$ROOT" "$sh_bin" \
+    "$ROOT/scripts/focus-doctor.sh" > "$apply_home/plugin-doctor.out" 2> "$apply_home/plugin-doctor.err"; plugin_doctor_rc=$?
+  env -i HOME="$apply_home" PATH="$apply_path" CLAUDE_PLUGIN_ROOT="$ROOT" "$sh_bin" \
+    "$ROOT/scripts/focus-tidy.sh" > "$apply_home/plugin-tidy.out" 2> "$apply_home/plugin-tidy.err"; plugin_tidy_rc=$?
+  env -i HOME="$apply_home" PATH="$apply_path" CLAUDE_PLUGIN_ROOT="$ROOT" "$sh_bin" \
+    "$ROOT/scripts/focus-tidy.sh" --apply > "$apply_home/plugin-noop.out" 2> "$apply_home/plugin-noop.err"; plugin_noop_rc=$?
+  apply_ok=1; apply_why=""
+  [ "$plugin_doctor_rc" = 0 ] && grep -qF $'OK\tall-clean\t' "$apply_home/plugin-doctor.out" &&
+    [ "$plugin_tidy_rc" = 0 ] && grep -qF $'NOTHING\tno-actions\t' "$apply_home/plugin-tidy.out" &&
+    [ "$plugin_noop_rc" = 0 ] && grep -qF $'APPLY\tno-op\t' "$apply_home/plugin-noop.out" || {
+      apply_ok=0; apply_why="doctor/tidy failed plugin-root resolution or nonempty no-op contract"
+    }
+  set -- "$apply_ledger".backup.*
+  [ ! -e "$1" ] || { apply_ok=0; apply_why="$apply_why; nonempty no-op created a backup"; }
+  report_case "$sh_bin" "Epic 4 scripts: plugin/direct resolution and nonempty no-op no-backup" "$apply_ok" "$apply_why"
+
+  rm -rf "$apply_home" "$apply_stub"
+}
+
+run_tidy_concurrency_rollback_checks() {
+  sh_bin=$1
+  command -v "$sh_bin" >/dev/null 2>&1 || return
+  race_home=$(mktemp -d); race_stub=$(mktemp -d); mkdir -p "$race_home/.claude"
+  race_ledger="$race_home/.claude/focus-ledger.md"
+  race_archive="$race_home/.claude/focus-ledger-archive.md"
+  make_epic4_date_stub "$race_stub"
+  race_path="$race_stub:$PATH"
+
+  cp "$FIX/tidy-mixed.md" "$race_ledger"
+  barrier_stub=$(mktemp -d)
+  cat > "$barrier_stub/mv" <<'TIDY_MV_BARRIER'
+#!/bin/sh
+for barrier_last do :; done
+if [ "$barrier_last" = "$FOCUS_RACE_LEDGER" ] && [ ! -e "$FOCUS_RACE_USED" ]; then
+  : > "$FOCUS_RACE_USED"
+  : > "$FOCUS_RACE_READY"
+  while [ ! -f "$FOCUS_RACE_RELEASE" ]; do sleep 0.05; done
+fi
+exec "$FOCUS_REAL_MV" "$@"
+TIDY_MV_BARRIER
+  chmod +x "$barrier_stub/mv"
+  race_ready="$race_home/tidy.ready"; race_release="$race_home/tidy.release"; race_used="$race_home/tidy.used"
+  env -i HOME="$race_home" PATH="$barrier_stub:$race_path" FOCUS_REAL_MV="$(command -v mv)" \
+    FOCUS_RACE_LEDGER="$race_ledger" FOCUS_RACE_READY="$race_ready" \
+    FOCUS_RACE_RELEASE="$race_release" FOCUS_RACE_USED="$race_used" \
+    "$sh_bin" "$ROOT/scripts/focus-tidy.sh" --apply > "$race_home/tidy.out" 2> "$race_home/tidy.err" & tidy_pid=$!
+  race_wait=0
+  while [ ! -f "$race_ready" ] && [ "$race_wait" -lt 200 ]; do sleep 0.05; race_wait=$((race_wait + 1)); done
+  env -i HOME="$race_home" PATH="$race_path" "$sh_bin" "$ROOT/scripts/focus-park.sh" \
+    'park racing tidy apply' > "$race_home/park.out" 2> "$race_home/park.err" & tidy_park_pid=$!
+  sleep 3.4
+  park_waited=0; kill -0 "$tidy_park_pid" 2>/dev/null && park_waited=1
+  : > "$race_release"
+  wait "$tidy_pid"; tidy_race_rc=$?
+  wait "$tidy_park_pid"; park_race_rc=$?
+  race_ok=1; race_why=""
+  [ -f "$race_ready" ] && [ "$park_waited" = 1 ] &&
+    [ "$tidy_race_rc" = 0 ] && [ "$park_race_rc" = 0 ] &&
+    [ "$(grep -cF 'park racing tidy apply' "$race_ledger")" = 1 ] &&
+    grep -qF 'threshold done item' "$race_archive" &&
+    [ ! -e "$race_ledger.lock" ] && [ ! -e "$race_ledger.lock.reap" ] || {
+      race_ok=0; race_why="apply/park did not serialize or an effect was lost (rcs=$tidy_race_rc/$park_race_rc)"
+    }
+  report_case "$sh_bin" "tidy apply+park: lock/write gate serialize and both effects land" "$race_ok" "$race_why"
+  rm -rf "$barrier_stub"
+
+  rm -f "$race_archive" "$race_ledger".backup.*
+  sed "s/@TODAY@/$TODAY/" "$FIX/populated.md" > "$race_ledger"
+  holder_ready="$race_home/holder.ready"; holder_go="$race_home/holder.go"
+  holder_cmd='FOCUS_LIB_DIR=$1; . "$1/focus-lib.sh"; focus_lock_acquire "$2" || exit 2; : > "$3"; while [ ! -f "$4" ]; do sleep 0.05; done; printf "%s\n" "- [x] (2023-09-01) landed while apply waited" >> "$2"; focus_lock_release'
+  env -i HOME="$race_home" PATH="$race_path" "$sh_bin" -c "$holder_cmd" tidy-holder \
+    "$ROOT/scripts" "$race_ledger" "$holder_ready" "$holder_go" & holder_pid=$!
+  holder_wait=0
+  while [ ! -f "$holder_ready" ] && [ "$holder_wait" -lt 100 ]; do sleep 0.05; holder_wait=$((holder_wait + 1)); done
+  env -i HOME="$race_home" PATH="$race_path" "$sh_bin" "$ROOT/scripts/focus-tidy.sh" --apply \
+    > "$race_home/wait-apply.out" 2> "$race_home/wait-apply.err" & wait_apply_pid=$!
+  sleep 0.2; : > "$holder_go"
+  wait "$holder_pid"; holder_rc=$?
+  wait "$wait_apply_pid"; wait_apply_rc=$?
+  race_ok=1; race_why=""
+  [ "$holder_rc" = 0 ] && [ "$wait_apply_rc" = 0 ] &&
+    [ "$(grep -cF 'landed while apply waited' "$race_archive")" = 1 ] &&
+    ! grep -qF 'landed while apply waited' "$race_ledger" || {
+      race_ok=0; race_why="candidate landed before lock acquisition was not freshly derived (rcs=$holder_rc/$wait_apply_rc)"
+    }
+  report_case "$sh_bin" "tidy apply: candidate landed while lock-waiting is freshly derived" "$race_ok" "$race_why"
+
+  rm -f "$race_archive" "$race_ledger".backup.*
+  cp "$FIX/tidy-mixed.md" "$race_ledger"; cp "$race_ledger" "$race_home/rollback-ledger.before"
+  printf '# Existing archive\nkeep me\n' > "$race_archive"; cp "$race_archive" "$race_home/rollback-archive.before"
+  printf '1699999999\n' > "$race_home/.claude/.focus-snooze"; cp "$race_home/.claude/.focus-snooze" "$race_home/snooze.before"
+  rollback_temp="$race_ledger.tmp.999999999.ABC123"; printf 'keep temp\n' > "$rollback_temp"; touch -t 200001010000 "$rollback_temp"; cp "$rollback_temp" "$race_home/temp.before"
+  env -i HOME="$race_home" PATH="$race_path" FOCUS_TIDY_TEST_FAIL=corrupt-ledger-before-verify "$sh_bin" \
+    "$ROOT/scripts/focus-tidy.sh" --apply > "$race_home/rollback.out" 2> "$race_home/rollback.err"; rollback_rc=$?
+  set -- "$race_ledger".backup.*; rollback_backup=$1
+  race_ok=1; race_why=""
+  [ "$rollback_rc" = 2 ] && cmp -s "$race_ledger" "$race_home/rollback-ledger.before" &&
+    cmp -s "$race_archive" "$race_home/rollback-archive.before" &&
+    cmp -s "$race_home/.claude/.focus-snooze" "$race_home/snooze.before" &&
+    cmp -s "$rollback_temp" "$race_home/temp.before" &&
+    [ -f "$rollback_backup" ] && cmp -s "$rollback_backup" "$race_home/rollback-ledger.before" &&
+    grep -qF 'ledger and archive restored from backups; markers and temps left unchanged' "$race_home/rollback.err" || {
+      race_ok=0; race_why="post-verify fault did not completely roll back/retain cleanup targets (rc=$rollback_rc)"
+    }
+  set -- "$race_archive".backup.*
+  [ ! -e "$1" ] || { race_ok=0; race_why="$race_why; archive backup leaked after rollback"; }
+  report_case "$sh_bin" "tidy rollback: ledger/archive restored and markers/temps untouched" "$race_ok" "$race_why"
+
+  signal_stub=$(mktemp -d)
+  cat > "$signal_stub/mv" <<'SIGNAL_AFTER_MV'
+#!/bin/sh
+for signal_last do :; done
+"$FOCUS_REAL_MV" "$@"
+signal_mv_rc=$?
+if [ "$signal_mv_rc" = 0 ] && [ "$signal_last" = "$FOCUS_SIGNAL_TARGET" ] && [ ! -e "$FOCUS_SIGNAL_ONCE" ]; then
+  : > "$FOCUS_SIGNAL_ONCE"
+  kill -TERM "$PPID"
+  sleep 0.1
+fi
+exit "$signal_mv_rc"
+SIGNAL_AFTER_MV
+  chmod +x "$signal_stub/mv"
+  race_ok=1; race_why=""
+  for signal_kind in archive ledger; do
+    rm -f "$race_archive" "$race_ledger".backup.* "$race_archive".backup.* "$race_home/signal.once"
+    cp "$FIX/tidy-mixed.md" "$race_ledger"; cp "$race_ledger" "$race_home/signal-ledger.before"
+    printf '# Signal archive\nkeep me\n' > "$race_archive"; cp "$race_archive" "$race_home/signal-archive.before"
+    if [ "$signal_kind" = archive ]; then signal_target=$race_archive; else signal_target=$race_ledger; fi
+    env -i HOME="$race_home" PATH="$signal_stub:$race_path" FOCUS_REAL_MV="$(command -v mv)" \
+      FOCUS_SIGNAL_TARGET="$signal_target" FOCUS_SIGNAL_ONCE="$race_home/signal.once" \
+      "$sh_bin" "$ROOT/scripts/focus-tidy.sh" --apply \
+      > "$race_home/signal-$signal_kind.out" 2> "$race_home/signal-$signal_kind.err"; signal_rc=$?
+    [ "$signal_rc" = 2 ] && [ -f "$race_home/signal.once" ] &&
+      cmp -s "$race_ledger" "$race_home/signal-ledger.before" &&
+      cmp -s "$race_archive" "$race_home/signal-archive.before" &&
+      [ ! -e "$race_ledger.lock" ] && [ ! -e "$race_ledger.lock.reap" ] &&
+      [ ! -e "$race_archive.lock" ] || {
+        race_ok=0; race_why="$race_why; signal after $signal_kind rename did not fully roll back (rc=$signal_rc)"
+      }
+  done
+  report_case "$sh_bin" "tidy rollback: signals immediately after archive/ledger rename are complete" "$race_ok" "$race_why"
+  rm -rf "$signal_stub"
+
+  rm -rf "$race_home" "$race_stub"
+}
+
+run_tidy_safety_injection_checks() {
+  sh_bin=$1
+  command -v "$sh_bin" >/dev/null 2>&1 || return
+  safe_home=$(mktemp -d); safe_stub=$(mktemp -d); mkdir -p "$safe_home/.claude"
+  safe_ledger="$safe_home/.claude/focus-ledger.md"
+  safe_archive="$safe_home/.claude/focus-ledger-archive.md"
+  make_epic4_date_stub "$safe_stub"
+  safe_path="$safe_stub:$PATH"
+
+  cp "$FIX/tidy-mixed.md" "$safe_ledger"; cp "$safe_ledger" "$safe_home/lock.before"
+  mkdir "$safe_ledger.lock" "$safe_ledger.lock.reap"
+  lock_fast_stub=$(mktemp -d); printf '#!/bin/sh\nexit 0\n' > "$lock_fast_stub/sleep"; chmod +x "$lock_fast_stub/sleep"
+  env -i HOME="$safe_home" PATH="$safe_path" "$sh_bin" "$ROOT/scripts/focus-tidy.sh" \
+    > "$safe_home/lock-report.out" 2> "$safe_home/lock-report.err"; lock_report_rc=$?
+  env -i HOME="$safe_home" PATH="$lock_fast_stub:$safe_path" "$sh_bin" "$ROOT/scripts/focus-tidy.sh" --apply \
+    > "$safe_home/lock-apply.out" 2> "$safe_home/lock-apply.err"; lock_apply_rc=$?
+  safe_ok=1; safe_why=""
+  [ "$lock_report_rc" = 0 ] && [ "$lock_apply_rc" = 2 ] &&
+    [ -d "$safe_ledger.lock" ] && [ -d "$safe_ledger.lock.reap" ] &&
+    cmp -s "$safe_ledger" "$safe_home/lock.before" || {
+      safe_ok=0; safe_why="report/apply removed a live/stale lock directory or changed ledger"
+    }
+  rmdir "$safe_ledger.lock"
+  env -i HOME="$safe_home" PATH="$lock_fast_stub:$safe_path" "$sh_bin" "$ROOT/scripts/focus-tidy.sh" --apply \
+    > "$safe_home/reap-apply.out" 2> "$safe_home/reap-apply.err"; reap_apply_rc=$?
+  [ "$reap_apply_rc" = 2 ] && [ -d "$safe_ledger.lock.reap" ] && [ ! -e "$safe_ledger.lock" ] &&
+    cmp -s "$safe_ledger" "$safe_home/lock.before" || {
+      safe_ok=0; safe_why="$safe_why; stale reap gate was removed or ledger changed"
+    }
+  set -- "$safe_ledger".backup.*
+  [ ! -e "$1" ] || { safe_ok=0; safe_why="$safe_why; lock refusal created backup"; }
+  report_case "$sh_bin" "tidy: report/apply never reap pre-existing ledger lock directories" "$safe_ok" "$safe_why"
+  rmdir "$safe_ledger.lock.reap"; rm -rf "$lock_fast_stub"
+
+  rm -f "$safe_ledger" "$safe_home/dangling-target" "$safe_ledger".backup.*
+  ln -s "$safe_home/dangling-target" "$safe_ledger"
+  env -i HOME="$safe_home" PATH="$safe_path" "$sh_bin" "$ROOT/scripts/focus-doctor.sh" \
+    > "$safe_home/dangling-doctor.out" 2> "$safe_home/dangling-doctor.err"; dangling_doctor_rc=$?
+  env -i HOME="$safe_home" PATH="$safe_path" "$sh_bin" "$ROOT/scripts/focus-tidy.sh" \
+    > "$safe_home/dangling-report.out" 2> "$safe_home/dangling-report.err"; dangling_report_rc=$?
+  env -i HOME="$safe_home" PATH="$safe_path" "$sh_bin" "$ROOT/scripts/focus-tidy.sh" --apply \
+    > "$safe_home/dangling-apply.out" 2> "$safe_home/dangling-apply.err"; dangling_apply_rc=$?
+  safe_ok=1; safe_why=""
+  [ "$dangling_doctor_rc" = 2 ] && grep -qF $'ledger-unsafe\t' "$safe_home/dangling-doctor.out" &&
+    [ "$dangling_report_rc" = 2 ] && [ "$dangling_apply_rc" = 2 ] &&
+    [ -L "$safe_ledger" ] && [ ! -e "$safe_home/dangling-target" ] &&
+    [ ! -e "$safe_ledger.lock" ] && [ ! -e "$safe_ledger.lock.reap" ] || {
+      safe_ok=0; safe_why="dangling primary ledger symlink was treated as missing or followed"
+    }
+  report_case "$sh_bin" "doctor/tidy: dangling primary ledger symlink is unsafe, never missing" "$safe_ok" "$safe_why"
+  rm -f "$safe_ledger"
+
+  safe_ok=1; safe_why=""
+  for archive_kind in symlink fifo; do
+    rm -f "$safe_archive" "$safe_home/archive-target" "$safe_ledger".backup.*
+    cp "$FIX/tidy-mixed.md" "$safe_ledger"; cp "$safe_ledger" "$safe_home/unsafe.before"
+    if [ "$archive_kind" = symlink ]; then
+      printf 'target unchanged\n' > "$safe_home/archive-target"
+      cp "$safe_home/archive-target" "$safe_home/archive-target.before"
+      ln -s "$safe_home/archive-target" "$safe_archive"
+    else
+      mkfifo "$safe_archive"
+    fi
+    env -i HOME="$safe_home" PATH="$safe_path" "$sh_bin" "$ROOT/scripts/focus-tidy.sh" \
+      > "$safe_home/$archive_kind.report" 2> "$safe_home/$archive_kind.report.err"; archive_report_rc=$?
+    env -i HOME="$safe_home" PATH="$safe_path" "$sh_bin" "$ROOT/scripts/focus-tidy.sh" --apply \
+      > "$safe_home/$archive_kind.out" 2> "$safe_home/$archive_kind.err"; safe_rc=$?
+    [ "$archive_report_rc" = 0 ] && grep -qF $'BLOCK\tarchive-unsafe\t' "$safe_home/$archive_kind.report" &&
+      [ "$safe_rc" = 2 ] && cmp -s "$safe_ledger" "$safe_home/unsafe.before" || {
+      safe_ok=0; safe_why="$safe_why; $archive_kind archive report/apply rc=$archive_report_rc/$safe_rc or ledger changed"
+    }
+    set -- "$safe_ledger".backup.*
+    [ ! -e "$1" ] || { safe_ok=0; safe_why="$safe_why; $archive_kind refusal created backup"; }
+    if [ "$archive_kind" = symlink ]; then
+      cmp -s "$safe_home/archive-target" "$safe_home/archive-target.before" || {
+        safe_ok=0; safe_why="$safe_why; archive symlink target changed"
+      }
+    fi
+  done
+  report_case "$sh_bin" "tidy apply: archive symlink/FIFO refused unchanged before backup" "$safe_ok" "$safe_why"
+  rm -f "$safe_archive" "$safe_home/archive-target"
+
+  backup_stub=$(mktemp -d)
+  cat > "$backup_stub/mktemp" <<'UNSAFE_BACKUP_MKTEMP'
+#!/bin/sh
+case $1 in
+  *.backup.*) printf '%s\n' "$FOCUS_FAKE_BACKUP" ;;
+  *) exec "$FOCUS_REAL_MKTEMP" "$@" ;;
+esac
+UNSAFE_BACKUP_MKTEMP
+  chmod +x "$backup_stub/mktemp"
+  safe_ok=1; safe_why=""
+  for backup_kind in symlink fifo; do
+    fake_backup="$safe_home/fake-$backup_kind-backup"
+    rm -f "$fake_backup" "$safe_home/backup-target" "$safe_archive"
+    cp "$FIX/tidy-mixed.md" "$safe_ledger"; cp "$safe_ledger" "$safe_home/unsafe-backup.before"
+    if [ "$backup_kind" = symlink ]; then
+      printf 'backup target unchanged\n' > "$safe_home/backup-target"
+      cp "$safe_home/backup-target" "$safe_home/backup-target.before"
+      ln -s "$safe_home/backup-target" "$fake_backup"
+    else
+      mkfifo "$fake_backup"
+    fi
+    env -i HOME="$safe_home" PATH="$backup_stub:$safe_path" FOCUS_FAKE_BACKUP="$fake_backup" \
+      FOCUS_REAL_MKTEMP="$(command -v mktemp)" "$sh_bin" "$ROOT/scripts/focus-tidy.sh" --apply \
+      > "$safe_home/backup-$backup_kind.out" 2> "$safe_home/backup-$backup_kind.err"; backup_safe_rc=$?
+    [ "$backup_safe_rc" = 2 ] && cmp -s "$safe_ledger" "$safe_home/unsafe-backup.before" &&
+      { [ -L "$fake_backup" ] || [ -p "$fake_backup" ]; } || {
+        safe_ok=0; safe_why="$safe_why; $backup_kind backup was followed/changed or rc=$backup_safe_rc"
+      }
+    if [ "$backup_kind" = symlink ]; then
+      cmp -s "$safe_home/backup-target" "$safe_home/backup-target.before" || {
+        safe_ok=0; safe_why="$safe_why; backup symlink target changed"
+      }
+    fi
+  done
+  report_case "$sh_bin" "tidy apply: generated backup symlink/FIFO is refused without following" "$safe_ok" "$safe_why"
+  rm -f "$fake_backup" "$safe_home/backup-target"; rm -rf "$backup_stub"
+
+  cp "$FIX/tidy-mixed.md" "$safe_ledger"; cp "$safe_ledger" "$safe_home/unsafe-marker.before"
+  printf '1699999999\n' > "$safe_home/marker-target"; cp "$safe_home/marker-target" "$safe_home/marker-target.before"
+  ln -s "$safe_home/marker-target" "$safe_home/.claude/.focus-snooze"
+  unsafe_temp="$safe_ledger.tmp.999999999.ABC123"; mkfifo "$unsafe_temp"
+  env -i HOME="$safe_home" PATH="$safe_path" "$sh_bin" "$ROOT/scripts/focus-tidy.sh" \
+    > "$safe_home/unsafe-report.out" 2> "$safe_home/unsafe-report.err"; unsafe_report_rc=$?
+  env -i HOME="$safe_home" PATH="$safe_path" "$sh_bin" "$ROOT/scripts/focus-tidy.sh" --apply \
+    > "$safe_home/unsafe-apply.out" 2> "$safe_home/unsafe-apply.err"; unsafe_apply_rc=$?
+  safe_ok=1; safe_why=""
+  [ "$unsafe_report_rc" = 0 ] && [ "$unsafe_apply_rc" = 2 ] &&
+    grep -qF $'snooze-unsafe\t' "$safe_home/unsafe-report.out" &&
+    grep -qF $'temp-unsafe\t' "$safe_home/unsafe-report.out" &&
+    cmp -s "$safe_ledger" "$safe_home/unsafe-marker.before" &&
+    cmp -s "$safe_home/marker-target" "$safe_home/marker-target.before" &&
+    [ -L "$safe_home/.claude/.focus-snooze" ] && [ -p "$unsafe_temp" ] || {
+      safe_ok=0; safe_why="unsafe marker/temp was followed, changed, or not blocking"
+    }
+  set -- "$safe_ledger".backup.*
+  [ ! -e "$1" ] || { safe_ok=0; safe_why="$safe_why; unsafe-path refusal created backup"; }
+  report_case "$sh_bin" "tidy: marker/temp symlink/FIFO report then refuse apply unchanged" "$safe_ok" "$safe_why"
+  rm -f "$safe_home/.claude/.focus-snooze" "$safe_home/marker-target" "$unsafe_temp"
+
+  injection_canary="$safe_home/focus_pwned"
+  sed "s#/tmp/focus_pwned#$injection_canary#g" "$FIX/injection.md" > "$safe_ledger"
+  env -i HOME="$safe_home" PATH="$safe_path" "$sh_bin" "$ROOT/scripts/focus-resume.sh" injection \
+    > "$safe_home/injection-resume.out" 2> "$safe_home/injection-resume.err"; injection_resume_rc=$?
+  env -i HOME="$safe_home" PATH="$safe_path" "$sh_bin" "$ROOT/scripts/focus-doctor.sh" \
+    > "$safe_home/injection-doctor.out" 2> "$safe_home/injection-doctor.err"; injection_doctor_rc=$?
+  env -i HOME="$safe_home" PATH="$safe_path" "$sh_bin" "$ROOT/scripts/focus-tidy.sh" \
+    > "$safe_home/injection-report.out" 2> "$safe_home/injection-report.err"; injection_report_rc=$?
+  env -i HOME="$safe_home" PATH="$safe_path" "$sh_bin" "$ROOT/scripts/focus-tidy.sh" --apply \
+    > "$safe_home/injection-apply.out" 2> "$safe_home/injection-apply.err"; injection_apply_rc=$?
+  safe_ok=1; safe_why=""
+  [ "$injection_resume_rc" = 0 ] && [ "$injection_doctor_rc" = 0 ] &&
+    [ "$injection_report_rc" = 0 ] && [ "$injection_apply_rc" = 0 ] &&
+    [ ! -e "$injection_canary" ] && grep -qF '$(touch' "$safe_home/injection-report.out" &&
+    grep -qF '$(touch' "$safe_ledger" || {
+      safe_ok=0; safe_why="doctor/tidy report/apply executed or dropped hostile ledger text"
+    }
+  report_case "$sh_bin" "security: doctor and tidy report/apply keep injection canary inert" "$safe_ok" "$safe_why"
+
+  rm -rf "$safe_home" "$safe_stub"
+}
+
 main() {
   shells=${1:-}
   if [ -n "$shells" ]; then set -- "$shells"; else set -- bash dash; fi
@@ -1543,6 +2329,11 @@ main() {
     run_epic3_contract_checks "$s"
     run_epic3_injection_matrix "$s"
     run_native_snooze_check "$s"
+    run_doctor_checks "$s"
+    run_tidy_report_checks "$s"
+    run_tidy_apply_checks "$s"
+    run_tidy_concurrency_rollback_checks "$s"
+    run_tidy_safety_injection_checks "$s"
   done
   echo
   echo "TOTAL: $pass passed, $fail failed"

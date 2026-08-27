@@ -35,18 +35,115 @@ focus_stale_threshold() {
   printf '%s\n' "$focus_threshold_value"
 }
 
+# Tidy follows the same strict decimal policy as stale listing. An unset or
+# invalid value safely falls back to 30; it is never passed through awk's loose
+# numeric coercion.
+focus_archive_threshold() {
+  focus_archive_value=${FOCUS_ARCHIVE_DAYS:-30}
+  case $focus_archive_value in
+    ''|*[!0-9]*) focus_archive_value=30 ;;
+    *) [ "${#focus_archive_value}" -le 9 ] || focus_archive_value=30 ;;
+  esac
+  printf '%s\n' "$focus_archive_value"
+}
+
 focus_parser_ready() {
   [ -n "$FOCUS_PARSE_AWK" ] && [ -f "$FOCUS_PARSE_AWK" ]
 }
 
+# Inspect an epoch marker without following symlinks or reading non-regular
+# paths. Output is state<TAB>value, where state is missing, unsafe, unreadable,
+# malformed, active, or expired.
+focus_marker_status() {
+  focus_marker_check_path=$1
+  focus_marker_check_now=$2
+  if [ -L "$focus_marker_check_path" ]; then
+    printf 'unsafe\t-\n'
+    return 0
+  fi
+  if [ ! -e "$focus_marker_check_path" ]; then
+    printf 'missing\t-\n'
+    return 0
+  fi
+  if [ ! -f "$focus_marker_check_path" ]; then
+    printf 'unsafe\t-\n'
+    return 0
+  fi
+  if [ ! -r "$focus_marker_check_path" ]; then
+    printf 'unreadable\t-\n'
+    return 0
+  fi
+  focus_marker_line_count=$(awk 'END { print NR + 0 }' "$focus_marker_check_path" 2>/dev/null) || {
+    printf 'unreadable\t-\n'
+    return 0
+  }
+  focus_marker_check_value=
+  IFS= read -r focus_marker_check_value < "$focus_marker_check_path" ||
+    [ -n "$focus_marker_check_value" ] || true
+  if [ "$focus_marker_line_count" != 1 ] ||
+     ! focus_is_safe_epoch "$focus_marker_check_value"; then
+    printf 'malformed\t-\n'
+    return 0
+  fi
+  if focus_decimal_le "$focus_marker_check_value" "$focus_marker_check_now"; then
+    printf 'expired\t%s\n' "$focus_marker_check_value"
+  else
+    printf 'active\t%s\n' "$focus_marker_check_value"
+  fi
+}
+
+# Portable read-only mtime lookup for conservative stale-temp classification.
+focus_file_mtime_epoch() {
+  focus_mtime_path=$1
+  if focus_mtime_value=$(stat -f '%m' "$focus_mtime_path" 2>/dev/null) &&
+     focus_is_safe_epoch "$focus_mtime_value"; then
+    printf '%s\n' "$focus_mtime_value"
+    return 0
+  fi
+  if focus_mtime_value=$(stat -c '%Y' "$focus_mtime_path" 2>/dev/null) &&
+     focus_is_safe_epoch "$focus_mtime_value"; then
+    printf '%s\n' "$focus_mtime_value"
+    return 0
+  fi
+  return 1
+}
+
+# Only the PID-bearing shape emitted by focus_rewrite_begin is eligible. The
+# recorded process must also be gone before tidy treats the path as stale; old
+# six-character or manual .tmp names remain doctor-only because provenance is
+# not recoverable from their names.
+focus_is_tidy_temp_path() {
+  focus_temp_path=$1
+  focus_temp_owner_pid=
+  case $focus_temp_path in
+    "$FOCUS_LEDGER".tmp.*) focus_temp_suffix=${focus_temp_path#"$FOCUS_LEDGER".tmp.} ;;
+    *) return 1 ;;
+  esac
+  focus_temp_owner_pid=${focus_temp_suffix%%.*}
+  focus_temp_tail=${focus_temp_suffix#*.}
+  [ "$focus_temp_tail" != "$focus_temp_suffix" ] || return 1
+  case $focus_temp_owner_pid in ''|*[!0-9]*) return 1 ;; esac
+  case $focus_temp_tail in
+    [[:alnum:]][[:alnum:]][[:alnum:]][[:alnum:]][[:alnum:]][[:alnum:]]|\
+    [[:alnum:]][[:alnum:]][[:alnum:]][[:alnum:]][[:alnum:]][[:alnum:]].trim) ;;
+    *) return 1 ;;
+  esac
+  ! kill -0 "$focus_temp_owner_pid" 2>/dev/null
+}
+
 # Convert the local calendar date used by focus-park into the shared civil-day
 # number. Using date +%F rather than epoch/86400 avoids UTC/local midnight drift.
-focus_today_days() {
+focus_calendar_days() {
   focus_parser_ready || return 2
-  focus_calendar_today=$(date +%F) || return 2
+  focus_calendar_today=$1
   FOCUS_PARSE_MODE=date-days \
   FOCUS_CALENDAR_DATE=$focus_calendar_today \
     awk -f "$FOCUS_PARSE_AWK" </dev/null
+}
+
+focus_today_days() {
+  focus_calendar_today=$(date +%F) || return 2
+  focus_calendar_days "$focus_calendar_today"
 }
 
 focus_parse_session_start() {
@@ -79,6 +176,91 @@ focus_list_items() {
   FOCUS_TODAY_DAYS=$focus_list_today \
   FOCUS_STALE_THRESHOLD=$focus_list_threshold \
     awk -f "$FOCUS_PARSE_AWK" "$FOCUS_LEDGER"
+}
+
+focus_doctor_ledger() {
+  focus_parser_ready || return 2
+  FOCUS_PARSE_MODE=doctor \
+  FOCUS_PARKED_HEAD="$FOCUS_PARKED_HEAD" \
+  FOCUS_SESSION_HEAD="$FOCUS_SESSION_HEAD" \
+  FOCUS_LEDGER_PATH="$FOCUS_LEDGER" \
+    awk -f "$FOCUS_PARSE_AWK" "$FOCUS_LEDGER"
+}
+
+focus_scan_markers() {
+  focus_parser_ready || return 2
+  FOCUS_PARSE_MODE=markers \
+  FOCUS_MARKER_PATH=$1 \
+    awk -f "$FOCUS_PARSE_AWK" "$1"
+}
+
+focus_tidy_ledger_report() {
+  focus_parser_ready || return 2
+  FOCUS_PARSE_MODE=tidy-report \
+  FOCUS_PARKED_HEAD="$FOCUS_PARKED_HEAD" \
+  FOCUS_SESSION_HEAD="$FOCUS_SESSION_HEAD" \
+  FOCUS_LEDGER_PATH="$FOCUS_LEDGER" \
+  FOCUS_ARCHIVE_PATH=$1 \
+  FOCUS_TODAY_DAYS=$2 \
+  FOCUS_ARCHIVE_DAYS=$3 \
+    awk -f "$FOCUS_PARSE_AWK" "$FOCUS_LEDGER"
+}
+
+focus_tidy_rewrite() {
+  focus_parser_ready || return 2
+  FOCUS_PARSE_MODE=tidy-rewrite \
+  FOCUS_PARKED_HEAD="$FOCUS_PARKED_HEAD" \
+  FOCUS_SESSION_HEAD="$FOCUS_SESSION_HEAD" \
+  FOCUS_TODAY_DAYS=$1 \
+  FOCUS_ARCHIVE_DAYS=$2 \
+    awk -f "$FOCUS_PARSE_AWK" "$FOCUS_LEDGER"
+}
+
+focus_tidy_archive_lines() {
+  focus_parser_ready || return 2
+  FOCUS_PARSE_MODE=tidy-archive \
+  FOCUS_PARKED_HEAD="$FOCUS_PARKED_HEAD" \
+  FOCUS_SESSION_HEAD="$FOCUS_SESSION_HEAD" \
+  FOCUS_TODAY_DAYS=$1 \
+  FOCUS_ARCHIVE_DAYS=$2 \
+    awk -f "$FOCUS_PARSE_AWK" "$FOCUS_LEDGER"
+}
+
+focus_raw_open_lines() {
+  focus_parser_ready || return 2
+  FOCUS_PARSE_MODE=raw-open \
+  FOCUS_PARKED_HEAD="$FOCUS_PARKED_HEAD" \
+  FOCUS_SESSION_HEAD="$FOCUS_SESSION_HEAD" \
+    awk -f "$FOCUS_PARSE_AWK" "$1"
+}
+
+focus_raw_near_lines() {
+  focus_parser_ready || return 2
+  FOCUS_PARSE_MODE=raw-near \
+  FOCUS_PARKED_HEAD="$FOCUS_PARKED_HEAD" \
+  FOCUS_SESSION_HEAD="$FOCUS_SESSION_HEAD" \
+    awk -f "$FOCUS_PARSE_AWK" "$1"
+}
+
+# Emit every pre-state ledger record except done lines selected for archival.
+# Sorting this multiset and comparing it to every post-state record independently
+# proves that prose, comments, blank lines, headings, and fresh done lines survive.
+focus_raw_retained_lines() {
+  focus_parser_ready || return 2
+  FOCUS_PARSE_MODE=raw-retained \
+  FOCUS_PARKED_HEAD="$FOCUS_PARKED_HEAD" \
+  FOCUS_SESSION_HEAD="$FOCUS_SESSION_HEAD" \
+  FOCUS_TODAY_DAYS=$2 \
+  FOCUS_ARCHIVE_DAYS=$3 \
+    awk -f "$FOCUS_PARSE_AWK" "$1"
+}
+
+focus_structure_valid() {
+  focus_parser_ready || return 2
+  FOCUS_PARSE_MODE=structure-check \
+  FOCUS_PARKED_HEAD="$FOCUS_PARKED_HEAD" \
+  FOCUS_SESSION_HEAD="$FOCUS_SESSION_HEAD" \
+    awk -f "$FOCUS_PARSE_AWK" "$1" >/dev/null
 }
 
 # Print rank<TAB>section<TAB>source-line<TAB>escaped-raw-item for every match.
@@ -235,10 +417,12 @@ focus_lock_prepare() {
 focus_try_lock() {
   focus_lock_i=0
   while [ "$focus_lock_i" -lt "$1" ]; do
+    FOCUS_LOCKED=maybe
     if focus_lock_claim_dir "$FOCUS_LOCK" "$FOCUS_LOCK_TOKEN"; then
       FOCUS_LOCKED=1
       return 0
     fi
+    FOCUS_LOCKED=
     sleep 0.1
     focus_lock_i=$((focus_lock_i + 1))
   done
@@ -342,7 +526,7 @@ focus_rewrite_begin() {
   else
     FOCUS_PRE_FINAL_NEWLINE=1
   fi
-  FOCUS_TMP=$(mktemp "$FOCUS_LEDGER.XXXXXX" 2>/dev/null) || return 1
+  FOCUS_TMP=$(mktemp "$FOCUS_LEDGER.tmp.$$.XXXXXX" 2>/dev/null) || return 1
 }
 
 focus_rewrite_discard() {
