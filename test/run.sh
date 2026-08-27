@@ -1365,6 +1365,55 @@ IDENTITY_AWK
   report_case "$sh_bin" "done: operational lock failure is unchanged" "$contract_ok" "$contract_why"
   rm -rf "$lock_stub"
 
+  # Hold resume at its final rename until park has exhausted the main-lock
+  # windows. The fallback append must wait on the write gate, then land after
+  # resume publishes instead of being overwritten by its older snapshot.
+  cp "$FIX/race.md" "$contract_ledger"
+  publish_stub=$(mktemp -d)
+  cat > "$publish_stub/mv" <<'PUBLISH_BARRIER'
+#!/bin/sh
+: > "$FOCUS_PUBLISH_READY"
+while [ ! -f "$FOCUS_PUBLISH_RELEASE" ]; do sleep 0.05; done
+exec "$FOCUS_REAL_MV" "$@"
+PUBLISH_BARRIER
+  chmod +x "$publish_stub/mv"
+  publish_ready="$contract_home/publish.ready"; publish_release="$contract_home/publish.release"
+  env -i HOME="$contract_home" PATH="$publish_stub:$contract_path" \
+    FOCUS_REAL_MV="$(command -v mv)" FOCUS_PUBLISH_READY="$publish_ready" \
+    FOCUS_PUBLISH_RELEASE="$publish_release" "$sh_bin" "$ROOT/scripts/focus-resume.sh" \
+    'target race' > "$contract_home/publish-resume.out" 2> "$contract_home/publish-resume.err" & publish_resume_pid=$!
+  publish_wait=0
+  while [ ! -f "$publish_ready" ] && [ "$publish_wait" -lt 100 ]; do sleep 0.05; publish_wait=$((publish_wait + 1)); done
+  env -i HOME="$contract_home" PATH="$contract_path" "$sh_bin" "$ROOT/scripts/focus-park.sh" \
+    'fallback during publish' > "$contract_home/publish-park.out" 2> "$contract_home/publish-park.err" & publish_park_pid=$!
+  sleep 3.4
+  publish_park_waited=0
+  kill -0 "$publish_park_pid" 2>/dev/null && publish_park_waited=1
+  : > "$publish_release"
+  wait "$publish_resume_pid"; publish_resume_rc=$?
+  wait "$publish_park_pid"; publish_park_rc=$?
+  contract_ok=1; contract_why=""
+  [ -f "$publish_ready" ] && [ "$publish_park_waited" = 1 ] || {
+    contract_ok=0
+    contract_why="fallback append did not serialize behind publish"
+  }
+  [ "$publish_resume_rc" = 0 ] && [ "$publish_park_rc" = 0 ] || {
+    contract_ok=0
+    contract_why="$contract_why; rcs=$publish_resume_rc/$publish_park_rc"
+  }
+  [ "$(grep -cF 'fallback during publish' "$contract_ledger")" = 1 ] &&
+    [ "$(grep -cF 'target race item' "$contract_ledger")" = 1 ] || {
+      contract_ok=0
+      contract_why="$contract_why; a concurrent effect was lost or duplicated"
+    }
+  awk '/^## This session/{session=1; next} session && /target race item/{found=1} END{exit !found}' \
+    "$contract_ledger" || {
+      contract_ok=0
+      contract_why="$contract_why; resume effect did not land"
+    }
+  report_case "$sh_bin" "resume+fallback park: append cannot be overwritten by publish" "$contract_ok" "$contract_why"
+  rm -rf "$publish_stub"
+
   # A cooperative owner records its PID, so another caller must not reap it even
   # after the stale-lock timeout. Once the owner releases, no lock litter remains.
   lock_target="$contract_home/ownership-target"

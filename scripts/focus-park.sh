@@ -20,14 +20,32 @@ item="- [ ] ($today) $thing"
 mkdir -p "$(dirname "$FOCUS_LEDGER")"
 
 # One atomic O_APPEND write is the last-resort path. It may place an item at EOF,
-# but it cannot overwrite another session's item.
+# but it cannot overwrite another session's item. The existing reap token gates
+# this append against guarded rename publication, closing the append/mv race.
 _append_park() {
-  if [ ! -f "$FOCUS_LEDGER" ]; then
-    printf '# Focus ledger\n\n%s\n\n%s\n' "$FOCUS_PARKED_HEAD" "$FOCUS_SESSION_HEAD" >> "$FOCUS_LEDGER"
-  elif [ -s "$FOCUS_LEDGER" ] && [ -n "$(tail -c 1 "$FOCUS_LEDGER")" ]; then
-    printf '\n' >> "$FOCUS_LEDGER"
+  append_guard=0
+  if focus_write_gate_acquire; then
+    append_guard=1
+  else
+    append_gate_rc=$?
+    # An unmanaged reap token also blocks cooperative renames, so direct append
+    # remains the only safe progress path in that legacy/stale state.
+    [ "$append_gate_rc" = 2 ] || return 1
   fi
-  printf '%s\n' "$item" >> "$FOCUS_LEDGER"
+
+  append_rc=0
+  if [ ! -f "$FOCUS_LEDGER" ]; then
+    if ! printf '# Focus ledger\n\n%s\n\n%s\n' "$FOCUS_PARKED_HEAD" "$FOCUS_SESSION_HEAD" >> "$FOCUS_LEDGER"; then
+      append_rc=1
+    fi
+  elif [ -s "$FOCUS_LEDGER" ] && [ -n "$(tail -c 1 "$FOCUS_LEDGER")" ]; then
+    if ! printf '\n' >> "$FOCUS_LEDGER"; then append_rc=1; fi
+  fi
+  if [ "$append_rc" = 0 ] && ! printf '%s\n' "$item" >> "$FOCUS_LEDGER"; then
+    append_rc=1
+  fi
+  [ "$append_guard" = 0 ] || focus_write_gate_release
+  return "$append_rc"
 }
 
 _do_park() {

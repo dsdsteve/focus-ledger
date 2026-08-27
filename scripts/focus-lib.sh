@@ -158,6 +158,7 @@ FOCUS_LOCK_TOKEN=
 FOCUS_REAP_TOKEN=
 FOCUS_LOCKED=
 FOCUS_REAPING=
+FOCUS_WRITE_GATE=
 FOCUS_TMP=
 FOCUS_TRIM=
 FOCUS_PRE_BYTES=
@@ -213,6 +214,7 @@ focus_lock_cleanup() {
   FOCUS_TMP=
   FOCUS_LOCKED=
   FOCUS_REAPING=
+  FOCUS_WRITE_GATE=
 }
 
 focus_lock_prepare() {
@@ -223,6 +225,7 @@ focus_lock_prepare() {
   FOCUS_REAP_TOKEN="reap.$$"
   FOCUS_LOCKED=
   FOCUS_REAPING=
+  FOCUS_WRITE_GATE=
   FOCUS_TMP=
   FOCUS_TRIM=
   trap 'focus_lock_cleanup; exit 1' INT TERM HUP
@@ -242,20 +245,27 @@ focus_try_lock() {
   return 1
 }
 
-# A lock created by this library records its shell PID. Cooperative live owners
-# are never reaped; legacy/empty locks and owners whose process exited remain stale.
-focus_lock_owner_alive() {
+# Return success only when a library-owned directory records a live PID.
+focus_lock_dir_owner_alive() {
+  focus_owner_dir=$1
+  focus_owner_prefix=$2
   focus_owner_token=
-  [ -f "$FOCUS_LOCK/owner" ] && [ ! -L "$FOCUS_LOCK/owner" ] || return 1
-  IFS= read -r focus_owner_token < "$FOCUS_LOCK/owner" || return 1
+  [ -f "$focus_owner_dir/owner" ] && [ ! -L "$focus_owner_dir/owner" ] || return 1
+  IFS= read -r focus_owner_token < "$focus_owner_dir/owner" || return 1
   case $focus_owner_token in
-    lock.*) focus_owner_pid=${focus_owner_token#lock.} ;;
+    "$focus_owner_prefix".*) focus_owner_pid=${focus_owner_token#*.} ;;
     *) return 1 ;;
   esac
   case $focus_owner_pid in
     ''|*[!0-9]*) return 1 ;;
   esac
   kill -0 "$focus_owner_pid" 2>/dev/null
+}
+
+# A lock created by this library records its shell PID. Cooperative live owners
+# are never reaped; legacy/empty locks and owners whose process exited remain stale.
+focus_lock_owner_alive() {
+  focus_lock_dir_owner_alive "$FOCUS_LOCK" lock
 }
 
 # Preserve park's hardened mutex: primary bounded wait, serialized stale-lock
@@ -281,7 +291,46 @@ focus_lock_release() {
   if [ -n "${FOCUS_REAPING:-}" ]; then
     focus_lock_drop_owned_dir "$FOCUS_REAP" "$FOCUS_REAP_TOKEN"
     FOCUS_REAPING=
+    FOCUS_WRITE_GATE=
   fi
+}
+
+# The existing reap token doubles as a publication gate. This serializes the
+# lockless park fallback with the checksum+rename step used by guarded rewrites:
+# append-before-publish forces a retry; publish-before-append targets the new file.
+focus_write_gate_acquire() {
+  FOCUS_WRITE_GATE=
+  if [ -n "${FOCUS_REAPING:-}" ] &&
+     focus_lock_dir_owned "$FOCUS_REAP" "$FOCUS_REAP_TOKEN"; then
+    FOCUS_WRITE_GATE=borrowed
+    return 0
+  fi
+
+  while :; do
+    if focus_lock_claim_dir "$FOCUS_REAP" "$FOCUS_REAP_TOKEN"; then
+      FOCUS_REAPING=1
+      FOCUS_WRITE_GATE=owned
+      return 0
+    fi
+    if [ ! -f "$FOCUS_REAP/owner" ] || [ -L "$FOCUS_REAP/owner" ]; then
+      # An unmanaged reap token blocks all cooperative publishers. Callers may
+      # use the append-only path, but guarded renames must fail unchanged.
+      return 2
+    fi
+    if focus_lock_dir_owner_alive "$FOCUS_REAP" reap; then
+      sleep 0.05
+      continue
+    fi
+    focus_lock_reap_dir "$FOCUS_REAP"
+  done
+}
+
+focus_write_gate_release() {
+  if [ "${FOCUS_WRITE_GATE:-}" = owned ]; then
+    focus_lock_drop_owned_dir "$FOCUS_REAP" "$FOCUS_REAP_TOKEN"
+    FOCUS_REAPING=
+  fi
+  FOCUS_WRITE_GATE=
 }
 
 focus_rewrite_begin() {
@@ -359,11 +408,17 @@ focus_rewrite_valid_mutation() {
 }
 
 focus_rewrite_publish() {
-  # Re-check immediately beside the rename; callers retry when this returns 2.
-  focus_rewrite_source_unchanged || return 2
+  focus_write_gate_acquire || return 1
+  # Re-check while fallback appends are excluded; callers retry on status 2.
+  if ! focus_rewrite_source_unchanged; then
+    focus_write_gate_release
+    return 2
+  fi
   if mv "$FOCUS_TMP" "$FOCUS_LEDGER"; then
     FOCUS_TMP=
+    focus_write_gate_release
     return 0
   fi
+  focus_write_gate_release
   return 1
 }
