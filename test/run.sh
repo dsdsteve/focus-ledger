@@ -150,7 +150,7 @@ run_stop_state_checks() {
   stop_ledger="$stop_home/.claude/focus-ledger.md"
   stop_marker="$stop_home/.claude/.focus-last-nudge"
   stop_snooze="$stop_home/.claude/.focus-snooze"
-  printf '#!/bin/sh\nprintf "1700000000\\n"\n' > "$stop_stub/date"
+  printf '#!/bin/sh\ncase $1 in +%%s) printf "1700000000\\n" ;; +%%F) printf "2023-11-14\\n" ;; *) exit 1 ;; esac\n' > "$stop_stub/date"
   chmod +x "$stop_stub/date"
   stop_path="$stop_stub:$PATH"
   printf '1700014400\n' > "$stop_home/default-marker.expected"
@@ -614,6 +614,871 @@ inner
   rm -rf "$bhome"
 }
 
+make_fixed_date_stub() {
+  fixed_dir=$1
+  cat > "$fixed_dir/date" <<'DATE_STUB'
+#!/bin/sh
+case $1 in
+  +%s) printf '1700000000\n'; exit 0 ;;
+  +%F) printf '2023-11-14\n'; exit 0 ;;
+  --version)
+    case ${FOCUS_DATE_STYLE:-bsd} in gnu|gnu-collision) printf 'GNU date\n'; exit 0 ;; *) exit 1 ;; esac
+    ;;
+  -r)
+    case ${FOCUS_DATE_STYLE:-bsd} in
+      bsd) fixed_epoch=$2 ;;
+      gnu) exit 1 ;;
+      gnu-collision)
+        # If this branch is reached, GNU -r was misdetected as epoch formatting.
+        printf '123\n'
+        exit 0
+        ;;
+    esac
+    ;;
+  -d) fixed_epoch=${2#@} ;;
+  *) exit 1 ;;
+esac
+case $fixed_epoch in
+  1700000000) printf '2023-11-14 22:13\n' ;;
+  1700086400) printf '2023-11-15 22:13\n' ;;
+  1700014400) printf '2023-11-15 02:13\n' ;;
+  1700001800) printf '2023-11-14 22:43\n' ;;
+  *) exit 1 ;;
+esac
+DATE_STUB
+  chmod +x "$fixed_dir/date"
+}
+
+run_parser_match_list_checks() {
+  sh_bin=$1
+  command -v "$sh_bin" >/dev/null 2>&1 || return
+  new_home=$(mktemp -d); new_stub=$(mktemp -d); mkdir -p "$new_home/.claude"
+  new_ledger="$new_home/.claude/focus-ledger.md"
+  make_fixed_date_stub "$new_stub"
+  new_path="$new_stub:$PATH"
+  cp "$FIX/ranked.md" "$new_ledger"
+
+  records=$(env -i HOME="$new_home" PATH="$new_path" \
+    FOCUS_PARSE_MODE=records \
+    FOCUS_PARKED_HEAD='## Parked (durable — carries across sessions)' \
+    FOCUS_SESSION_HEAD='## This session (volatile — clear whenever)' \
+    awk -f "$ROOT/scripts/focus-parse.awk" "$new_ledger")
+  new_ok=1; new_why=""
+  printf '%s\n' "$records" | grep -qF $'parked\t4\t1\t2023-11-10\tfresh alpha project' || { new_ok=0; new_why="$new_why; valid parked metadata missing"; }
+  printf '%s\n' "$records" | grep -qF $'parked\t10\t0' || { new_ok=0; new_why="$new_why; malformed item not exposed as invalid"; }
+  printf '%s\n' "$records" | grep -qF $'outside\t17\t1' || { new_ok=0; new_why="$new_why; outside section metadata missing"; }
+  printf '%s\n' "$records" | grep -qF 'commented alpha example' && { new_ok=0; new_why="$new_why; comment example leaked"; }
+  report_case "$sh_bin" "parser: sections, validity, and comment skip" "$new_ok" "$new_why"
+
+  cat > "$new_home/list.expected" <<'LIST_DEFAULT'
+1	parked	13	1	5	stale alpha beta
+2	parked	4	0	4	fresh alpha project
+3	session	9	1	13	session beta
+4	session	0	0	14	session gamma
+LIST_DEFAULT
+  env -i HOME="$new_home" PATH="$new_path" "$sh_bin" "$ROOT/scripts/focus-list.sh" > "$new_home/list.out" 2> "$new_home/list.err"; new_rc=$?
+  new_ok=1; new_why=""
+  [ "$new_rc" = 0 ] || { new_ok=0; new_why="rc=$new_rc"; }
+  cmp -s "$new_home/list.out" "$new_home/list.expected" || { new_ok=0; new_why="$new_why; default TSV differs"; }
+  [ ! -s "$new_home/list.err" ] || { new_ok=0; new_why="$new_why; stderr not empty"; }
+  report_case "$sh_bin" "list: exact ranks, ages, tiers, source lines" "$new_ok" "$new_why"
+
+  cat > "$new_home/list30.expected" <<'LIST_30'
+1	parked	4	0	4	fresh alpha project
+2	parked	13	0	5	stale alpha beta
+3	session	9	0	13	session beta
+4	session	0	0	14	session gamma
+LIST_30
+  env -i HOME="$new_home" PATH="$new_path" FOCUS_STALE_DAYS=30 "$sh_bin" "$ROOT/scripts/focus-list.sh" > "$new_home/list30.out" 2> "$new_home/list30.err"; new_rc=$?
+  new_ok=1; new_why=""
+  [ "$new_rc" = 0 ] || { new_ok=0; new_why="rc=$new_rc"; }
+  cmp -s "$new_home/list30.out" "$new_home/list30.expected" || { new_ok=0; new_why="$new_why; threshold=30 TSV differs"; }
+  report_case "$sh_bin" "list: threshold changes stale tier and ranks" "$new_ok" "$new_why"
+
+  env -i HOME="$new_home" PATH="$new_path" FOCUS_STALE_DAYS=bogus "$sh_bin" "$ROOT/scripts/focus-list.sh" > "$new_home/list-invalid.out" 2> "$new_home/list-invalid.err"; new_rc=$?
+  new_ok=1; new_why=""
+  [ "$new_rc" = 0 ] || { new_ok=0; new_why="rc=$new_rc"; }
+  cmp -s "$new_home/list-invalid.out" "$new_home/list.expected" || { new_ok=0; new_why="$new_why; invalid threshold did not use 7"; }
+  report_case "$sh_bin" "list: invalid threshold uses seven" "$new_ok" "$new_why"
+
+  rm -f "$new_ledger"
+  env -i HOME="$new_home" PATH="$new_path" "$sh_bin" "$ROOT/scripts/focus-list.sh" > "$new_home/missing.out" 2> "$new_home/missing.err"; new_rc=$?
+  new_ok=1; new_why=""
+  [ "$new_rc" = 0 ] && [ ! -s "$new_home/missing.out" ] && [ ! -s "$new_home/missing.err" ] || { new_ok=0; new_why="missing ledger was not clean empty success"; }
+  : > "$new_ledger"
+  env -i HOME="$new_home" PATH="$new_path" "$sh_bin" "$ROOT/scripts/focus-list.sh" > "$new_home/empty.out" 2> "$new_home/empty.err"; empty_rc=$?
+  [ "$empty_rc" = 0 ] && [ ! -s "$new_home/empty.out" ] && [ ! -s "$new_home/empty.err" ] || { new_ok=0; new_why="$new_why; empty ledger was not clean empty success"; }
+  report_case "$sh_bin" "list: missing and empty ledgers succeed empty" "$new_ok" "$new_why"
+
+  cp "$FIX/ranked.md" "$new_ledger"
+  new_fail=$(mktemp -d)
+  printf '#!/bin/sh\nexit 1\n' > "$new_fail/date"; chmod +x "$new_fail/date"
+  env -i HOME="$new_home" PATH="$new_fail:$PATH" "$sh_bin" "$ROOT/scripts/focus-list.sh" > "$new_home/list-fail.out" 2> "$new_home/list-fail.err"; new_rc=$?
+  new_ok=1; new_why=""
+  [ "$new_rc" = 2 ] && [ ! -s "$new_home/list-fail.out" ] || { new_ok=0; new_why="rc/output=$new_rc/[$(cat "$new_home/list-fail.out")]"; }
+  report_case "$sh_bin" "list: operational date failure is nonzero, not empty success" "$new_ok" "$new_why"
+  rm -rf "$new_fail"
+
+  cat > "$new_home/leap.md" <<'LEAP_LEDGER'
+## Parked (durable — carries across sessions)
+- [ ] (2024-02-29) valid leap item
+- [ ] (2023-02-29) invalid leap item
+## This session (volatile — clear whenever)
+LEAP_LEDGER
+  leap_out=$(env -i PATH="$PATH" FOCUS_PARSE_MODE=list \
+    FOCUS_PARKED_HEAD='## Parked (durable — carries across sessions)' \
+    FOCUS_SESSION_HEAD='## This session (volatile — clear whenever)' \
+    FOCUS_TODAY_DAYS=19783 FOCUS_STALE_THRESHOLD=7 \
+    awk -f "$ROOT/scripts/focus-parse.awk" "$new_home/leap.md")
+  new_ok=1; new_why=""
+  [ "$leap_out" = $'1\tparked\t1\t0\t2\tvalid leap item' ] || { new_ok=0; new_why="leap output differs: [$leap_out]"; }
+  report_case "$sh_bin" "parser: valid leap day included, invalid leap day excluded" "$new_ok" "$new_why"
+
+  cp "$FIX/ranked.md" "$new_ledger"
+  match_cmd='FOCUS_LIB_DIR=$1; . "$1/focus-lib.sh"; focus_match "$2" "$3"'
+  match_out=$(env -i HOME="$new_home" PATH="$new_path" "$sh_bin" -c "$match_cmd" focus-match "$ROOT/scripts" 'ALPHA BETA' all 2> "$new_home/match.err"); match_rc=$?
+  printf '1\tparked\t5\t- [ ] (2023-11-01) stale alpha beta\n' > "$new_home/match.expected"
+  new_ok=1; new_why=""
+  [ "$match_rc" = 0 ] || { new_ok=0; new_why="rc=$match_rc"; }
+  [ "$match_out" = "$(cat "$new_home/match.expected")" ] || { new_ok=0; new_why="$new_why; unique AND/case-insensitive row differs"; }
+  report_case "$sh_bin" "matcher: case-insensitive AND unique -> rc0" "$new_ok" "$new_why"
+
+  match_out=$(env -i HOME="$new_home" PATH="$new_path" "$sh_bin" -c "$match_cmd" focus-match "$ROOT/scripts" alpha all 2> "$new_home/match.err"); match_rc=$?
+  cat > "$new_home/ambiguous.expected" <<'MATCH_AMBIGUOUS'
+1	parked	5	- [ ] (2023-11-01) stale alpha beta
+2	parked	4	- [ ] (2023-11-10) fresh alpha project
+MATCH_AMBIGUOUS
+  new_ok=1; new_why=""
+  [ "$match_rc" = 3 ] || { new_ok=0; new_why="rc=$match_rc want 3"; }
+  [ "$match_out" = "$(cat "$new_home/ambiguous.expected")" ] || { new_ok=0; new_why="$new_why; candidate TSV differs"; }
+  report_case "$sh_bin" "matcher: ambiguous -> rc3 and ranked candidates" "$new_ok" "$new_why"
+
+  match_out=$(env -i HOME="$new_home" PATH="$new_path" "$sh_bin" -c "$match_cmd" focus-match "$ROOT/scripts" 2 all 2> "$new_home/match.err"); match_rc=$?
+  new_ok=1; new_why=""
+  [ "$match_rc" = 0 ] || { new_ok=0; new_why="rc=$match_rc"; }
+  [ "$match_out" = $'2\tparked\t4\t- [ ] (2023-11-10) fresh alpha project' ] || { new_ok=0; new_why="$new_why; numeric global rank differs"; }
+  report_case "$sh_bin" "matcher: numeric query selects displayed global rank" "$new_ok" "$new_why"
+
+  match_out=$(env -i HOME="$new_home" PATH="$new_path" FOCUS_STALE_DAYS=30 "$sh_bin" -c "$match_cmd" focus-match "$ROOT/scripts" 1 all 2> "$new_home/match.err"); match_rc=$?
+  new_ok=1; new_why=""
+  [ "$match_rc" = 0 ] || { new_ok=0; new_why="rc=$match_rc"; }
+  [ "$match_out" = $'1\tparked\t4\t- [ ] (2023-11-10) fresh alpha project' ] || { new_ok=0; new_why="$new_why; non-default threshold rank differs"; }
+  report_case "$sh_bin" "matcher: numeric rank agrees with non-default list threshold" "$new_ok" "$new_why"
+
+  # A same-size edit must invalidate a guarded rewrite snapshot.
+  checksum_cmd='FOCUS_LIB_DIR=$1; . "$1/focus-lib.sh"; focus_rewrite_begin || exit 2; printf "X" | dd of="$FOCUS_LEDGER" bs=1 seek=0 conv=notrunc 2>/dev/null; focus_rewrite_source_unchanged; rc=$?; focus_rewrite_discard; exit "$rc"'
+  env -i HOME="$new_home" PATH="$new_path" "$sh_bin" -c "$checksum_cmd" checksum-guard "$ROOT/scripts" > "$new_home/checksum.out" 2> "$new_home/checksum.err"; checksum_rc=$?
+  new_ok=1; new_why=""
+  [ "$checksum_rc" = 1 ] || { new_ok=0; new_why="same-size source edit was accepted (rc=$checksum_rc)"; }
+  report_case "$sh_bin" "rewrite guard: same-size source edit is detected" "$new_ok" "$new_why"
+  cp "$FIX/ranked.md" "$new_ledger"
+
+  match_out=$(env -i HOME="$new_home" PATH="$new_path" "$sh_bin" -c "$match_cmd" focus-match "$ROOT/scripts" absent all 2> "$new_home/match.err"); match_rc=$?
+  new_ok=1; new_why=""
+  [ "$match_rc" = 1 ] && [ -z "$match_out" ] || { new_ok=0; new_why="rc/output=$match_rc/[$match_out]"; }
+  report_case "$sh_bin" "matcher: no match -> rc1 and empty output" "$new_ok" "$new_why"
+
+  canary="$new_home/focus_pwned"
+  sed "s#/tmp/focus_pwned#$canary#g" "$FIX/injection.md" > "$new_ledger"
+  env -i HOME="$new_home" PATH="$new_path" "$sh_bin" "$ROOT/scripts/focus-list.sh" > "$new_home/injection.out" 2> "$new_home/injection.err"; new_rc=$?
+  match_out=$(env -i HOME="$new_home" PATH="$new_path" "$sh_bin" -c "$match_cmd" focus-match "$ROOT/scripts" injection all 2> "$new_home/match.err"); match_rc=$?
+  new_ok=1; new_why=""
+  [ "$new_rc" = 0 ] && [ "$match_rc" = 0 ] || { new_ok=0; new_why="rcs=$new_rc/$match_rc"; }
+  [ ! -e "$canary" ] || { new_ok=0; new_why="$new_why; hostile text executed"; }
+  printf '%s\n' "$match_out" | grep -qF '$(touch' || { new_ok=0; new_why="$new_why; hostile raw text not preserved"; }
+  report_case "$sh_bin" "parser/matcher/list: hostile text remains inert data" "$new_ok" "$new_why"
+
+  rm -rf "$new_home" "$new_stub"
+}
+
+run_mutation_checks() {
+  sh_bin=$1
+  command -v "$sh_bin" >/dev/null 2>&1 || return
+  mut_home=$(mktemp -d); mut_stub=$(mktemp -d); mkdir -p "$mut_home/.claude"
+  mut_ledger="$mut_home/.claude/focus-ledger.md"
+  make_fixed_date_stub "$mut_stub"
+  mut_path="$mut_stub:$PATH"
+
+  cp "$FIX/ranked.md" "$mut_ledger"; cp "$mut_ledger" "$mut_home/before"
+  mut_out=$(env -i HOME="$mut_home" PATH="$mut_path" "$sh_bin" "$ROOT/scripts/focus-resume.sh" alpha 2> "$mut_home/err"); mut_rc=$?
+  mut_ok=1; mut_why=""
+  [ "$mut_rc" = 3 ] || { mut_ok=0; mut_why="rc=$mut_rc want 3"; }
+  cmp -s "$mut_ledger" "$mut_home/before" || { mut_ok=0; mut_why="$mut_why; ledger changed"; }
+  expected_resume_ambiguous=$'1\tparked\t5\t- [ ] (2023-11-01) stale alpha beta\n2\tparked\t4\t- [ ] (2023-11-10) fresh alpha project'
+  [ "$mut_out" = "$expected_resume_ambiguous" ] || { mut_ok=0; mut_why="$mut_why; candidate relay differs"; }
+  report_case "$sh_bin" "resume: ambiguous -> rc3, candidates, byte-identical ledger" "$mut_ok" "$mut_why"
+
+  mut_out=$(env -i HOME="$mut_home" PATH="$mut_path" "$sh_bin" "$ROOT/scripts/focus-resume.sh" absent 2> "$mut_home/err"); mut_rc=$?
+  mut_ok=1; mut_why=""
+  [ "$mut_rc" = 1 ] && [ -z "$mut_out" ] || { mut_ok=0; mut_why="rc/output=$mut_rc/[$mut_out]"; }
+  cmp -s "$mut_ledger" "$mut_home/before" || { mut_ok=0; mut_why="$mut_why; ledger changed"; }
+  report_case "$sh_bin" "resume: no match -> rc1 and byte-identical ledger" "$mut_ok" "$mut_why"
+
+  mut_out=$(env -i HOME="$mut_home" PATH="$mut_path" "$sh_bin" "$ROOT/scripts/focus-resume.sh" 3 2> "$mut_home/err"); mut_rc=$?
+  mut_ok=1; mut_why=""
+  [ "$mut_rc" = 1 ] && [ -z "$mut_out" ] || { mut_ok=0; mut_why="rc/output=$mut_rc/[$mut_out]"; }
+  cmp -s "$mut_ledger" "$mut_home/before" || { mut_ok=0; mut_why="$mut_why; session-rank resume changed ledger"; }
+  report_case "$sh_bin" "resume: global session rank is ineligible and unchanged" "$mut_ok" "$mut_why"
+
+  cp "$FIX/ranked.md" "$mut_ledger"
+  mut_out=$(env -i HOME="$mut_home" PATH="$mut_path" "$sh_bin" "$ROOT/scripts/focus-resume.sh" 'ALPHA BETA' 2> "$mut_home/err"); mut_rc=$?
+  mut_ok=1; mut_why=""
+  [ "$mut_rc" = 0 ] || { mut_ok=0; mut_why="rc=$mut_rc"; }
+  [ "$mut_out" = $'1\tparked\t5\t- [ ] (2023-11-01) stale alpha beta' ] || { mut_ok=0; mut_why="$mut_why; success TSV differs"; }
+  cmp -s "$mut_ledger" "$FIX/ranked-resumed.md" || { mut_ok=0; mut_why="$mut_why; moved ledger differs byte-for-byte"; }
+  [ ! -s "$mut_home/err" ] || { mut_ok=0; mut_why="$mut_why; stderr not empty"; }
+  report_case "$sh_bin" "resume: unique words move raw line byte-for-byte" "$mut_ok" "$mut_why"
+
+  cat > "$mut_ledger" <<'COMMENT_HEADING'
+# Focus ledger
+
+## Parked (durable — carries across sessions)
+- [ ] (2023-11-01) comment boundary target
+
+## This session (volatile — clear whenever)
+<!--
+## Fake heading inside comment
+-->
+## Notes
+COMMENT_HEADING
+  cat > "$mut_home/comment.expected" <<'COMMENT_EXPECTED'
+# Focus ledger
+
+## Parked (durable — carries across sessions)
+
+## This session (volatile — clear whenever)
+<!--
+## Fake heading inside comment
+-->
+- [ ] (2023-11-01) comment boundary target
+## Notes
+COMMENT_EXPECTED
+  mut_out=$(env -i HOME="$mut_home" PATH="$mut_path" "$sh_bin" "$ROOT/scripts/focus-resume.sh" 'comment boundary' 2> "$mut_home/err"); mut_rc=$?
+  mut_ok=1; mut_why=""
+  [ "$mut_rc" = 0 ] || { mut_ok=0; mut_why="rc=$mut_rc"; }
+  cmp -s "$mut_ledger" "$mut_home/comment.expected" || { mut_ok=0; mut_why="$mut_why; item inserted into or before comment"; }
+  report_case "$sh_bin" "resume: comment headings do not terminate session" "$mut_ok" "$mut_why"
+
+  cp "$FIX/ranked.md" "$mut_ledger"
+  mut_out=$(env -i HOME="$mut_home" PATH="$mut_path" "$sh_bin" "$ROOT/scripts/focus-resume.sh" 2 2> "$mut_home/err"); mut_rc=$?
+  mut_ok=1; mut_why=""
+  [ "$mut_rc" = 0 ] || { mut_ok=0; mut_why="rc=$mut_rc"; }
+  [ "$mut_out" = $'2\tparked\t4\t- [ ] (2023-11-10) fresh alpha project' ] || { mut_ok=0; mut_why="$mut_why; rank 2 output differs"; }
+  awk '/^## Notes/{exit} /^## This session/{ins=1} ins && /fresh alpha project/{found=1} END{exit !found}' "$mut_ledger" || { mut_ok=0; mut_why="$mut_why; rank 2 item not moved to session"; }
+  report_case "$sh_bin" "resume: numeric rank agrees with list" "$mut_ok" "$mut_why"
+
+  cp "$FIX/ranked.md" "$mut_ledger"
+  mut_out=$(env -i HOME="$mut_home" PATH="$mut_path" FOCUS_STALE_DAYS=30 "$sh_bin" "$ROOT/scripts/focus-resume.sh" 1 2> "$mut_home/err"); mut_rc=$?
+  mut_ok=1; mut_why=""
+  [ "$mut_rc" = 0 ] || { mut_ok=0; mut_why="rc=$mut_rc"; }
+  [ "$mut_out" = $'1\tparked\t4\t- [ ] (2023-11-10) fresh alpha project' ] || { mut_ok=0; mut_why="$mut_why; threshold rank 1 output differs"; }
+  report_case "$sh_bin" "resume: non-default threshold rank agrees with list" "$mut_ok" "$mut_why"
+
+  cp "$FIX/done-open.md" "$mut_ledger"
+  mut_out=$(env -i HOME="$mut_home" PATH="$mut_path" "$sh_bin" "$ROOT/scripts/focus-done.sh" 'only old' 2> "$mut_home/err"); mut_rc=$?
+  mut_ok=1; mut_why=""
+  [ "$mut_rc" = 0 ] || { mut_ok=0; mut_why="rc=$mut_rc"; }
+  [ "$mut_out" = $'1\tparked\t4\t- [ ] (2020-01-01) only old item' ] || { mut_ok=0; mut_why="$mut_why; success TSV differs"; }
+  cmp -s "$mut_ledger" "$FIX/done-closed.md" || { mut_ok=0; mut_why="$mut_why; more than checkbox bytes changed"; }
+  env -i HOME="$mut_home" PATH="$mut_path" FOCUS_NUDGE_COOLDOWN=0 "$sh_bin" "$ROOT/hooks/focus-stop.sh" > "$mut_home/stop.out" 2> "$mut_home/stop.err"; stop_rc=$?
+  [ "$stop_rc" = 0 ] && [ ! -s "$mut_home/stop.out" ] || { mut_ok=0; mut_why="$mut_why; completed item still nudged"; }
+  report_case "$sh_bin" "done: flips only checkbox and Stop ignores item" "$mut_ok" "$mut_why"
+
+  printf '%s' '# Focus ledger
+
+## Parked (durable — carries across sessions)
+- [ ] (2020-01-01) no final newline done
+
+## This session (volatile — clear whenever)' > "$mut_ledger"
+  printf '%s' '# Focus ledger
+
+## Parked (durable — carries across sessions)
+- [x] (2020-01-01) no final newline done
+
+## This session (volatile — clear whenever)' > "$mut_home/no-newline-done.expected"
+  mut_out=$(env -i HOME="$mut_home" PATH="$mut_path" "$sh_bin" "$ROOT/scripts/focus-done.sh" 'no final newline done' 2> "$mut_home/err"); mut_rc=$?
+  mut_ok=1; mut_why=""
+  [ "$mut_rc" = 0 ] || { mut_ok=0; mut_why="rc=$mut_rc"; }
+  cmp -s "$mut_ledger" "$mut_home/no-newline-done.expected" || { mut_ok=0; mut_why="$mut_why; EOF terminator or other bytes changed"; }
+  report_case "$sh_bin" "done: ledger without final newline preserves terminator" "$mut_ok" "$mut_why"
+
+  printf '%s' '# Focus ledger
+
+## Parked (durable — carries across sessions)
+- [ ] (2020-01-01) no final newline resume
+
+## This session (volatile — clear whenever)' > "$mut_ledger"
+  printf '%s' '# Focus ledger
+
+## Parked (durable — carries across sessions)
+
+## This session (volatile — clear whenever)
+- [ ] (2020-01-01) no final newline resume' > "$mut_home/no-newline-resume.expected"
+  mut_out=$(env -i HOME="$mut_home" PATH="$mut_path" "$sh_bin" "$ROOT/scripts/focus-resume.sh" 'no final newline resume' 2> "$mut_home/err"); mut_rc=$?
+  mut_ok=1; mut_why=""
+  [ "$mut_rc" = 0 ] || { mut_ok=0; mut_why="rc=$mut_rc"; }
+  cmp -s "$mut_ledger" "$mut_home/no-newline-resume.expected" || { mut_ok=0; mut_why="$mut_why; EOF terminator or move bytes changed"; }
+  report_case "$sh_bin" "resume: ledger without final newline preserves terminator" "$mut_ok" "$mut_why"
+
+  cp "$FIX/ranked.md" "$mut_ledger"
+  mut_out=$(env -i HOME="$mut_home" PATH="$mut_path" "$sh_bin" "$ROOT/scripts/focus-done.sh" gamma 2> "$mut_home/err"); mut_rc=$?
+  mut_ok=1; mut_why=""
+  [ "$mut_rc" = 0 ] || { mut_ok=0; mut_why="rc=$mut_rc"; }
+  [ "$mut_out" = $'4\tsession\t14\t- [ ] (2023-11-14) session gamma' ] || { mut_ok=0; mut_why="$mut_why; session success TSV differs"; }
+  grep -qF -- '- [x] (2023-11-14) session gamma' "$mut_ledger" || { mut_ok=0; mut_why="$mut_why; session checkbox unchanged"; }
+  report_case "$sh_bin" "done: matches and completes a session item" "$mut_ok" "$mut_why"
+
+  cp "$FIX/ranked.md" "$mut_ledger"; cp "$mut_ledger" "$mut_home/before"
+  mut_out=$(env -i HOME="$mut_home" PATH="$mut_path" "$sh_bin" "$ROOT/scripts/focus-done.sh" beta 2> "$mut_home/err"); mut_rc=$?
+  mut_ok=1; mut_why=""
+  [ "$mut_rc" = 3 ] || { mut_ok=0; mut_why="rc=$mut_rc want 3"; }
+  cmp -s "$mut_ledger" "$mut_home/before" || { mut_ok=0; mut_why="$mut_why; ambiguous done changed ledger"; }
+  printf '%s\n' "$mut_out" | grep -qF $'3\tsession\t13' || { mut_ok=0; mut_why="$mut_why; session candidate missing"; }
+  report_case "$sh_bin" "done: ambiguous across sections -> rc3 unchanged" "$mut_ok" "$mut_why"
+
+  mut_out=$(env -i HOME="$mut_home" PATH="$mut_path" "$sh_bin" "$ROOT/scripts/focus-done.sh" absent 2> "$mut_home/err"); mut_rc=$?
+  mut_ok=1; mut_why=""
+  [ "$mut_rc" = 1 ] && [ -z "$mut_out" ] || { mut_ok=0; mut_why="rc/output=$mut_rc/[$mut_out]"; }
+  cmp -s "$mut_ledger" "$mut_home/before" || { mut_ok=0; mut_why="$mut_why; no-match done changed ledger"; }
+  report_case "$sh_bin" "done: no match -> rc1 unchanged" "$mut_ok" "$mut_why"
+
+  printf '#!/bin/sh\nexit 0\n' > "$mut_stub/sleep"; chmod +x "$mut_stub/sleep"
+  cp "$FIX/ranked.md" "$mut_ledger"; cp "$mut_ledger" "$mut_home/before"
+  mkdir "$mut_ledger.lock" "$mut_ledger.lock.reap"
+  mut_out=$(env -i HOME="$mut_home" PATH="$mut_path" "$sh_bin" "$ROOT/scripts/focus-resume.sh" 'alpha beta' 2> "$mut_home/err"); mut_rc=$?
+  rmdir "$mut_ledger.lock" "$mut_ledger.lock.reap"
+  mut_ok=1; mut_why=""
+  [ "$mut_rc" = 4 ] && [ -z "$mut_out" ] || { mut_ok=0; mut_why="rc/output=$mut_rc/[$mut_out]"; }
+  cmp -s "$mut_ledger" "$mut_home/before" || { mut_ok=0; mut_why="$mut_why; lock failure changed ledger"; }
+  report_case "$sh_bin" "resume: operational lock failure is unchanged" "$mut_ok" "$mut_why"
+  rm -f "$mut_stub/sleep"
+
+  cp "$FIX/race.md" "$mut_ledger"
+  mkdir "$mut_ledger.lock"
+  ( sleep 0.4; rmdir "$mut_ledger.lock" 2>/dev/null ) & mutation_holder=$!
+  env -i HOME="$mut_home" PATH="$PATH" "$sh_bin" "$ROOT/scripts/focus-park.sh" 'parallel parked item' > "$mut_home/park.out" 2> "$mut_home/park.err" & park_pid=$!
+  env -i HOME="$mut_home" PATH="$PATH" "$sh_bin" "$ROOT/scripts/focus-resume.sh" 'target race' > "$mut_home/resume.out" 2> "$mut_home/resume.err" & resume_pid=$!
+  wait "$park_pid"; park_rc=$?
+  wait "$resume_pid"; resume_rc=$?
+  wait "$mutation_holder"
+  mut_ok=1; mut_why=""
+  [ "$park_rc" = 0 ] && [ "$resume_rc" = 0 ] || { mut_ok=0; mut_why="rcs=$park_rc/$resume_rc"; }
+  [ "$(grep -cF 'parallel parked item' "$mut_ledger")" = 1 ] || { mut_ok=0; mut_why="$mut_why; parked item missing or duplicated"; }
+  [ "$(grep -cF 'target race item' "$mut_ledger")" = 1 ] || { mut_ok=0; mut_why="$mut_why; resumed item missing or duplicated"; }
+  awk '/^## This session/{exit} /parallel parked item/{found=1} /target race item/{wrong=1} END{exit !(found && !wrong)}' "$mut_ledger" || { mut_ok=0; mut_why="$mut_why; Parked section effects wrong"; }
+  awk '/^## This session/{ins=1; next} ins && /target race item/{found=1} ins && /parallel parked item/{wrong=1} END{exit !(found && !wrong)}' "$mut_ledger" || { mut_ok=0; mut_why="$mut_why; session section effects wrong"; }
+  set -- "$mut_ledger".*
+  [ ! -e "$1" ] || { mut_ok=0; mut_why="$mut_why; lock/temp litter remains"; }
+  report_case "$sh_bin" "resume+park: concurrent effects both land" "$mut_ok" "$mut_why"
+
+  rm -rf "$mut_home" "$mut_stub"
+}
+
+run_snooze_checks() {
+  sh_bin=$1
+  command -v "$sh_bin" >/dev/null 2>&1 || return
+  snooze_home=$(mktemp -d); snooze_stub=$(mktemp -d); mkdir -p "$snooze_home/.claude"
+  snooze_marker="$snooze_home/.claude/.focus-snooze"
+  make_fixed_date_stub "$snooze_stub"
+  snooze_path="$snooze_stub:$PATH"
+
+  snooze_out=$(env -i HOME="$snooze_home" PATH="$snooze_path" "$sh_bin" "$ROOT/scripts/focus-snooze.sh" 2> "$snooze_home/err"); snooze_rc=$?
+  snooze_ok=1; snooze_why=""
+  [ "$snooze_rc" = 0 ] || { snooze_ok=0; snooze_why="rc=$snooze_rc"; }
+  [ "$snooze_out" = 'Nudge snoozed until 2023-11-15 22:13.' ] || { snooze_ok=0; snooze_why="$snooze_why; default output differs"; }
+  [ "$(cat "$snooze_marker")" = 1700086400 ] || { snooze_ok=0; snooze_why="$snooze_why; default marker differs"; }
+  report_case "$sh_bin" "snooze: empty defaults to one day" "$snooze_ok" "$snooze_why"
+
+  snooze_out=$(env -i HOME="$snooze_home" PATH="$snooze_path" "$sh_bin" "$ROOT/scripts/focus-snooze.sh" 4h 2> "$snooze_home/err"); snooze_rc=$?
+  snooze_ok=1; snooze_why=""
+  [ "$snooze_rc" = 0 ] && [ "$snooze_out" = 'Nudge snoozed until 2023-11-15 02:13.' ] || { snooze_ok=0; snooze_why="rc/output=$snooze_rc/[$snooze_out]"; }
+  [ "$(cat "$snooze_marker")" = 1700014400 ] || { snooze_ok=0; snooze_why="$snooze_why; 4h marker differs"; }
+  report_case "$sh_bin" "snooze: hours use BSD epoch formatting path" "$snooze_ok" "$snooze_why"
+
+  snooze_out=$(env -i HOME="$snooze_home" PATH="$snooze_path" FOCUS_DATE_STYLE=gnu "$sh_bin" "$ROOT/scripts/focus-snooze.sh" 30m 2> "$snooze_home/err"); snooze_rc=$?
+  snooze_ok=1; snooze_why=""
+  [ "$snooze_rc" = 0 ] && [ "$snooze_out" = 'Nudge snoozed until 2023-11-14 22:43.' ] || { snooze_ok=0; snooze_why="rc/output=$snooze_rc/[$snooze_out]"; }
+  [ "$(cat "$snooze_marker")" = 1700001800 ] || { snooze_ok=0; snooze_why="$snooze_why; 30m marker differs"; }
+  report_case "$sh_bin" "snooze: minutes use GNU epoch formatting fallback" "$snooze_ok" "$snooze_why"
+
+  snooze_out=$(env -i HOME="$snooze_home" PATH="$snooze_path" FOCUS_DATE_STYLE=gnu-collision "$sh_bin" "$ROOT/scripts/focus-snooze.sh" 30m 2> "$snooze_home/err"); snooze_rc=$?
+  snooze_ok=1; snooze_why=""
+  [ "$snooze_rc" = 0 ] && [ "$snooze_out" = 'Nudge snoozed until 2023-11-14 22:43.' ] || { snooze_ok=0; snooze_why="rc/output=$snooze_rc/[$snooze_out]"; }
+  report_case "$sh_bin" "snooze: GNU -r file semantics cannot select wrong time" "$snooze_ok" "$snooze_why"
+
+  printf 'sentinel\n' > "$snooze_marker"; cp "$snooze_marker" "$snooze_home/sentinel.expected"
+  snooze_ok=1; snooze_why=""
+  for bad_duration in garbage 0d 11574000000000d 999999999999999999999d; do
+    snooze_out=$(env -i HOME="$snooze_home" PATH="$snooze_path" "$sh_bin" "$ROOT/scripts/focus-snooze.sh" "$bad_duration" 2> "$snooze_home/err"); snooze_rc=$?
+    [ "$snooze_rc" = 2 ] && [ -z "$snooze_out" ] || { snooze_ok=0; snooze_why="$snooze_why; $bad_duration rc/output=$snooze_rc/[$snooze_out]"; }
+    cmp -s "$snooze_marker" "$snooze_home/sentinel.expected" || { snooze_ok=0; snooze_why="$snooze_why; $bad_duration changed marker"; }
+  done
+  report_case "$sh_bin" "snooze: malformed, zero, overflow -> rc2 unchanged" "$snooze_ok" "$snooze_why"
+
+  snooze_mv_stub=$(mktemp -d)
+  printf '#!/bin/sh\nexit 1\n' > "$snooze_mv_stub/mv"; chmod +x "$snooze_mv_stub/mv"
+  printf 'prior valid marker\n' > "$snooze_marker"; cp "$snooze_marker" "$snooze_home/prior-marker.expected"
+  snooze_out=$(env -i HOME="$snooze_home" PATH="$snooze_mv_stub:$snooze_path" "$sh_bin" "$ROOT/scripts/focus-snooze.sh" 4h 2> "$snooze_home/err"); snooze_rc=$?
+  snooze_ok=1; snooze_why=""
+  [ "$snooze_rc" = 1 ] && [ -z "$snooze_out" ] || { snooze_ok=0; snooze_why="rc/output=$snooze_rc/[$snooze_out]"; }
+  cmp -s "$snooze_marker" "$snooze_home/prior-marker.expected" || { snooze_ok=0; snooze_why="$snooze_why; prior marker was lost"; }
+  set -- "$snooze_marker".tmp.*
+  [ ! -e "$1" ] || { snooze_ok=0; snooze_why="$snooze_why; marker temp remains"; }
+  report_case "$sh_bin" "snooze: failed publish preserves prior regular marker" "$snooze_ok" "$snooze_why"
+  rm -rf "$snooze_mv_stub"
+
+  rm -f "$snooze_marker"
+  printf 'target unchanged\n' > "$snooze_home/target"; cp "$snooze_home/target" "$snooze_home/target.expected"
+  ln -s "$snooze_home/target" "$snooze_marker"
+  env -i HOME="$snooze_home" PATH="$snooze_path" "$sh_bin" "$ROOT/scripts/focus-snooze.sh" 4h > "$snooze_home/out" 2> "$snooze_home/err"; snooze_rc=$?
+  snooze_ok=1; snooze_why=""
+  [ "$snooze_rc" = 0 ] || { snooze_ok=0; snooze_why="rc=$snooze_rc"; }
+  cmp -s "$snooze_home/target" "$snooze_home/target.expected" || { snooze_ok=0; snooze_why="$snooze_why; symlink target changed"; }
+  [ -f "$snooze_marker" ] && [ ! -L "$snooze_marker" ] || { snooze_ok=0; snooze_why="$snooze_why; marker did not replace symlink"; }
+  [ "$(cat "$snooze_marker")" = 1700014400 ] || { snooze_ok=0; snooze_why="$snooze_why; replacement marker differs"; }
+  report_case "$sh_bin" "snooze: marker publish does not follow symlink" "$snooze_ok" "$snooze_why"
+
+  cp "$FIX/done-open.md" "$snooze_home/.claude/focus-ledger.md"
+  env -i HOME="$snooze_home" PATH="$snooze_path" "$sh_bin" "$ROOT/hooks/focus-stop.sh" > "$snooze_home/stop.out" 2> "$snooze_home/stop.err"; stop_rc=$?
+  snooze_ok=1; snooze_why=""
+  [ "$stop_rc" = 0 ] && [ ! -s "$snooze_home/stop.out" ] && [ ! -s "$snooze_home/stop.err" ] || { snooze_ok=0; snooze_why="active scripted snooze did not suppress Stop"; }
+  report_case "$sh_bin" "snooze: active marker suppresses Stop" "$snooze_ok" "$snooze_why"
+
+  rm -f "$snooze_marker" "$snooze_marker.lock" "$snooze_marker.lock.reap"
+  snooze_race_stub=$(mktemp -d)
+  cat > "$snooze_race_stub/mv" <<'MV_BARRIER'
+#!/bin/sh
+: > "$FOCUS_MV_READY"
+while [ ! -f "$FOCUS_MV_RELEASE" ]; do sleep 0.05; done
+exec "$FOCUS_REAL_MV" "$@"
+MV_BARRIER
+  chmod +x "$snooze_race_stub/mv"
+  race_ready="$snooze_home/mv.ready"; race_release="$snooze_home/mv.release"
+  env -i HOME="$snooze_home" PATH="$snooze_race_stub:$snooze_path" \
+    FOCUS_REAL_MV="$(command -v mv)" FOCUS_MV_READY="$race_ready" FOCUS_MV_RELEASE="$race_release" \
+    "$sh_bin" "$ROOT/scripts/focus-snooze.sh" 4h > "$snooze_home/race-snooze.out" 2> "$snooze_home/race-snooze.err" & race_snooze_pid=$!
+  race_wait=0
+  while [ ! -f "$race_ready" ] && [ "$race_wait" -lt 100 ]; do sleep 0.05; race_wait=$((race_wait + 1)); done
+  env -i HOME="$snooze_home" PATH="$snooze_path" "$sh_bin" "$ROOT/hooks/focus-stop.sh" > "$snooze_home/race-stop.out" 2> "$snooze_home/race-stop.err" & race_stop_pid=$!
+  sleep 0.2
+  : > "$race_release"
+  wait "$race_snooze_pid"; race_snooze_rc=$?
+  wait "$race_stop_pid"; race_stop_rc=$?
+  snooze_ok=1; snooze_why=""
+  [ "$race_snooze_rc" = 0 ] && [ "$race_stop_rc" = 0 ] || { snooze_ok=0; snooze_why="rcs=$race_snooze_rc/$race_stop_rc"; }
+  [ -f "$race_ready" ] || { snooze_ok=0; snooze_why="$snooze_why; snooze never reached publish barrier"; }
+  [ ! -s "$snooze_home/race-stop.out" ] || { snooze_ok=0; snooze_why="$snooze_why; Stop nudged during concurrent snooze"; }
+  [ "$(cat "$snooze_marker")" = 1700014400 ] || { snooze_ok=0; snooze_why="$snooze_why; future marker missing"; }
+  [ ! -d "$snooze_marker.lock" ] && [ ! -d "$snooze_marker.lock.reap" ] || { snooze_ok=0; snooze_why="$snooze_why; marker lock litter remains"; }
+  report_case "$sh_bin" "snooze+Stop: marker lock serializes concurrent publish/read" "$snooze_ok" "$snooze_why"
+  rm -rf "$snooze_race_stub"
+
+  rm -rf "$snooze_home" "$snooze_stub"
+}
+
+run_plugin_root_checks() {
+  sh_bin=$1
+  command -v "$sh_bin" >/dev/null 2>&1 || return
+  plugin_home=$(mktemp -d); plugin_stub=$(mktemp -d); mkdir -p "$plugin_home/.claude"
+  plugin_ledger="$plugin_home/.claude/focus-ledger.md"
+  make_fixed_date_stub "$plugin_stub"
+  plugin_path="$plugin_stub:$PATH"
+  plugin_ok=1; plugin_why=""
+
+  cp "$FIX/ranked.md" "$plugin_ledger"
+  env -i HOME="$plugin_home" PATH="$plugin_path" CLAUDE_PLUGIN_ROOT="$ROOT" "$sh_bin" "$ROOT/hooks/focus-session-start.sh" > "$plugin_home/session.out" 2> "$plugin_home/session.err"; plugin_rc=$?
+  [ "$plugin_rc" = 0 ] && grep -qF 'fresh alpha project' "$plugin_home/session.out" || { plugin_ok=0; plugin_why="$plugin_why; session-start failed"; }
+
+  env -i HOME="$plugin_home" PATH="$plugin_path" CLAUDE_PLUGIN_ROOT="$ROOT" "$sh_bin" "$ROOT/scripts/focus-list.sh" > "$plugin_home/list.out" 2> "$plugin_home/list.err"; plugin_rc=$?
+  [ "$plugin_rc" = 0 ] && grep -qF $'1\tparked\t13\t1' "$plugin_home/list.out" || { plugin_ok=0; plugin_why="$plugin_why; list failed"; }
+
+  cp "$FIX/ranked.md" "$plugin_ledger"
+  env -i HOME="$plugin_home" PATH="$plugin_path" CLAUDE_PLUGIN_ROOT="$ROOT" "$sh_bin" "$ROOT/scripts/focus-resume.sh" 'alpha beta' > "$plugin_home/resume.out" 2> "$plugin_home/resume.err"; plugin_rc=$?
+  [ "$plugin_rc" = 0 ] && grep -qF 'stale alpha beta' "$plugin_home/resume.out" || { plugin_ok=0; plugin_why="$plugin_why; resume failed"; }
+
+  cp "$FIX/done-open.md" "$plugin_ledger"
+  env -i HOME="$plugin_home" PATH="$plugin_path" CLAUDE_PLUGIN_ROOT="$ROOT" "$sh_bin" "$ROOT/scripts/focus-done.sh" 'only old' > "$plugin_home/done.out" 2> "$plugin_home/done.err"; plugin_rc=$?
+  [ "$plugin_rc" = 0 ] && grep -qF -- '- [x] (2020-01-01) only old item' "$plugin_ledger" || { plugin_ok=0; plugin_why="$plugin_why; done failed"; }
+
+  env -i HOME="$plugin_home" PATH="$plugin_path" CLAUDE_PLUGIN_ROOT="$ROOT" "$sh_bin" "$ROOT/scripts/focus-snooze.sh" 4h > "$plugin_home/snooze.out" 2> "$plugin_home/snooze.err"; plugin_rc=$?
+  [ "$plugin_rc" = 0 ] && [ "$(cat "$plugin_home/.claude/.focus-snooze")" = 1700014400 ] || { plugin_ok=0; plugin_why="$plugin_why; snooze failed"; }
+
+  rm -f "$plugin_home/.claude/.focus-snooze" "$plugin_home/.claude/.focus-last-nudge"
+  cp "$FIX/done-open.md" "$plugin_ledger"
+  env -i HOME="$plugin_home" PATH="$plugin_path" CLAUDE_PLUGIN_ROOT="$ROOT" FOCUS_NUDGE_COOLDOWN=0 "$sh_bin" "$ROOT/hooks/focus-stop.sh" > "$plugin_home/stop.out" 2> "$plugin_home/stop.err"; plugin_rc=$?
+  [ "$plugin_rc" = 0 ] && grep -qF 'Open a while: only old item' "$plugin_home/stop.out" || { plugin_ok=0; plugin_why="$plugin_why; stop failed"; }
+
+  cp "$FIX/populated.md" "$plugin_ledger"
+  env -i HOME="$plugin_home" PATH="$plugin_path" CLAUDE_PLUGIN_ROOT="$ROOT" "$sh_bin" "$ROOT/scripts/focus-park.sh" 'plugin path park' > "$plugin_home/park.out" 2> "$plugin_home/park.err"; plugin_rc=$?
+  [ "$plugin_rc" = 0 ] && grep -qF 'plugin path park' "$plugin_ledger" || { plugin_ok=0; plugin_why="$plugin_why; park failed"; }
+  report_case "$sh_bin" "plugin root: hooks and every command script resolve shared files" "$plugin_ok" "$plugin_why"
+
+  partial_root=$(mktemp -d); mkdir -p "$partial_root/hooks" "$partial_root/home/.claude"
+  cp "$ROOT/hooks/focus-session-start.sh" "$ROOT/hooks/focus-stop.sh" "$partial_root/hooks/"
+  cp "$FIX/populated.md" "$partial_root/home/.claude/focus-ledger.md"
+  env -i HOME="$partial_root/home" PATH="$PATH" "$sh_bin" "$partial_root/hooks/focus-session-start.sh" > "$partial_root/session.out" 2> "$partial_root/session.err"; partial_session_rc=$?
+  env -i HOME="$partial_root/home" PATH="$PATH" "$sh_bin" "$partial_root/hooks/focus-stop.sh" > "$partial_root/stop.out" 2> "$partial_root/stop.err"; partial_stop_rc=$?
+  plugin_ok=1; plugin_why=""
+  [ "$partial_session_rc" = 0 ] && [ "$partial_stop_rc" = 0 ] &&
+    [ ! -s "$partial_root/session.out" ] && [ ! -s "$partial_root/session.err" ] &&
+    [ ! -s "$partial_root/stop.out" ] && [ ! -s "$partial_root/stop.err" ] || {
+      plugin_ok=0
+      plugin_why="rcs=$partial_session_rc/$partial_stop_rc or output was not silent"
+    }
+  report_case "$sh_bin" "hooks: missing shared library remains soft and silent" "$plugin_ok" "$plugin_why"
+
+  rm -rf "$plugin_home" "$plugin_stub" "$partial_root"
+}
+
+run_epic3_contract_checks() {
+  sh_bin=$1
+  command -v "$sh_bin" >/dev/null 2>&1 || return
+  contract_home=$(mktemp -d); contract_stub=$(mktemp -d); mkdir -p "$contract_home/.claude"
+  contract_ledger="$contract_home/.claude/focus-ledger.md"
+  make_fixed_date_stub "$contract_stub"
+  contract_path="$contract_stub:$PATH"
+
+  # Stop, list, and numeric matching share one validated threshold and one strict
+  # item parser. Invalid thresholds fall back to seven instead of awk numeric zero.
+  cat > "$contract_ledger" <<'FRESH_THRESHOLD'
+# Focus ledger
+
+## Parked (durable — carries across sessions)
+- [ ] (2023-11-10) four day item
+
+## This session (volatile — clear whenever)
+FRESH_THRESHOLD
+  contract_ok=1; contract_why=""
+  for bad_threshold in bogus -1 1234567890; do
+    env -i HOME="$contract_home" PATH="$contract_path" FOCUS_STALE_DAYS="$bad_threshold" \
+      FOCUS_NUDGE_COOLDOWN=0 "$sh_bin" "$ROOT/hooks/focus-stop.sh" \
+      > "$contract_home/stop-invalid.out" 2> "$contract_home/stop-invalid.err"; contract_rc=$?
+    [ "$contract_rc" = 0 ] && [ ! -s "$contract_home/stop-invalid.out" ] &&
+      [ ! -s "$contract_home/stop-invalid.err" ] || {
+        contract_ok=0
+        contract_why="$contract_why; threshold $bad_threshold did not fall back to seven"
+      }
+  done
+  report_case "$sh_bin" "stop: invalid stale thresholds use seven consistently" "$contract_ok" "$contract_why"
+
+  cat > "$contract_ledger" <<'STRICT_STALE'
+# Focus ledger
+
+## Parked (durable — carries across sessions)
+- [ ] (2023-02-29) impossible leap item
+
+## This session (volatile — clear whenever)
+
+## Notes
+- [ ] (2020-01-01) outside old item
+STRICT_STALE
+  env -i HOME="$contract_home" PATH="$contract_path" FOCUS_NUDGE_COOLDOWN=0 \
+    "$sh_bin" "$ROOT/hooks/focus-stop.sh" > "$contract_home/strict.out" 2> "$contract_home/strict.err"; contract_rc=$?
+  contract_ok=1; contract_why=""
+  [ "$contract_rc" = 0 ] && [ ! -s "$contract_home/strict.out" ] && [ ! -s "$contract_home/strict.err" ] || {
+    contract_ok=0
+    contract_why="invalid-date or outside-section item reached Stop"
+  }
+  report_case "$sh_bin" "stop: strict dates and exact sections match list/matcher" "$contract_ok" "$contract_why"
+
+  # Civil-day age follows the local date used by park, even when epoch/86400
+  # represents a different UTC day.
+  local_day_stub=$(mktemp -d)
+  cat > "$local_day_stub/date" <<'LOCAL_DAY_DATE'
+#!/bin/sh
+case $1 in
+  +%F) printf '2023-11-15\n' ;;
+  +%s) printf '1700000000\n' ;;
+  *) exit 1 ;;
+esac
+LOCAL_DAY_DATE
+  chmod +x "$local_day_stub/date"
+  cat > "$contract_ledger" <<'LOCAL_DAY_LEDGER'
+# Focus ledger
+
+## Parked (durable — carries across sessions)
+- [ ] (2023-11-14) local day item
+
+## This session (volatile — clear whenever)
+LOCAL_DAY_LEDGER
+  env -i HOME="$contract_home" PATH="$local_day_stub:$PATH" "$sh_bin" \
+    "$ROOT/scripts/focus-list.sh" > "$contract_home/local-day.out" 2> "$contract_home/local-day.err"; contract_rc=$?
+  contract_ok=1; contract_why=""
+  [ "$contract_rc" = 0 ] &&
+    grep -qF $'1\tparked\t1\t0\t4\tlocal day item' "$contract_home/local-day.out" &&
+    [ ! -s "$contract_home/local-day.err" ] || {
+      contract_ok=0
+      contract_why="age did not use local calendar day"
+    }
+  report_case "$sh_bin" "date math: ages use park's local calendar day" "$contract_ok" "$contract_why"
+  rm -rf "$local_day_stub"
+
+  # Hand-edited tabs, backslashes, and controls cannot create extra TSV fields.
+  {
+    printf '%s\n' '# Focus ledger' '' '## Parked (durable — carries across sessions)'
+    printf '%s\n' $'- [ ] (2023-11-10) tab\titem \\ path'
+    printf '%s\n' '' '## This session (volatile — clear whenever)'
+  } > "$contract_ledger"
+  env -i HOME="$contract_home" PATH="$contract_path" "$sh_bin" \
+    "$ROOT/scripts/focus-list.sh" > "$contract_home/safe-tsv.out" 2> "$contract_home/safe-tsv.err"; contract_rc=$?
+  printf '1\tparked\t4\t0\t4\ttab\\titem \\\\ path\n' > "$contract_home/safe-tsv.expected"
+  match_cmd='FOCUS_LIB_DIR=$1; . "$1/focus-lib.sh"; focus_match "$2" "$3"'
+  contract_match=$(env -i HOME="$contract_home" PATH="$contract_path" "$sh_bin" -c "$match_cmd" \
+    focus-match "$ROOT/scripts" 'tab item path' all 2> "$contract_home/safe-match.err"); contract_match_rc=$?
+  contract_ok=1; contract_why=""
+  [ "$contract_rc" = 0 ] && cmp -s "$contract_home/safe-tsv.out" "$contract_home/safe-tsv.expected" || {
+    contract_ok=0
+    contract_why="safe list TSV differs"
+  }
+  awk -F '\t' 'NF != 6 { exit 1 }' "$contract_home/safe-tsv.out" || {
+    contract_ok=0
+    contract_why="$contract_why; list field count changed"
+  }
+  [ "$contract_match_rc" = 0 ] &&
+    [ "$contract_match" = $'1\tparked\t4\t- [ ] (2023-11-10) tab\\titem \\\\ path' ] || {
+      contract_ok=0
+      contract_why="$contract_why; matcher escaping differs"
+    }
+  printf '%s\n' "$contract_match" | awk -F '\t' 'NF != 4 { exit 1 }' || {
+    contract_ok=0
+    contract_why="$contract_why; matcher field count changed"
+  }
+  report_case "$sh_bin" "TSV: user controls are escaped with fixed field counts" "$contract_ok" "$contract_why"
+
+  contract_leading=$(env -i HOME="$contract_home" PATH="$contract_path" "$sh_bin" -c "$match_cmd" \
+    focus-match "$ROOT/scripts" 0001 all 2> "$contract_home/numeric.err"); leading_rc=$?
+  contract_huge=$(env -i HOME="$contract_home" PATH="$contract_path" "$sh_bin" -c "$match_cmd" \
+    focus-match "$ROOT/scripts" 999999999999999999999 all 2> "$contract_home/numeric.err"); huge_rc=$?
+  contract_ok=1; contract_why=""
+  [ "$leading_rc" = 0 ] && [ "$contract_leading" = "$contract_match" ] || {
+    contract_ok=0
+    contract_why="leading-zero rank did not select rank 1"
+  }
+  [ "$huge_rc" = 1 ] && [ -z "$contract_huge" ] || {
+    contract_ok=0
+    contract_why="$contract_why; huge numeric rank was not a clean no-match"
+  }
+  report_case "$sh_bin" "matcher: decimal rank semantics are pinned" "$contract_ok" "$contract_why"
+
+  # Park and resume use the parser's shared comment/section state machine.
+  cat > "$contract_ledger" <<'PARK_COMMENT'
+# Focus ledger
+
+## Parked (durable — carries across sessions)
+<!--
+## This session (volatile — clear whenever)
+-->
+
+## This session (volatile — clear whenever)
+PARK_COMMENT
+  cat > "$contract_home/park-comment.expected" <<'PARK_COMMENT_EXPECTED'
+# Focus ledger
+
+## Parked (durable — carries across sessions)
+<!--
+## This session (volatile — clear whenever)
+-->
+- [ ] (2023-11-14) shared parser park
+
+## This session (volatile — clear whenever)
+PARK_COMMENT_EXPECTED
+  env -i HOME="$contract_home" PATH="$contract_path" "$sh_bin" "$ROOT/scripts/focus-park.sh" \
+    'shared parser park' > "$contract_home/park-comment.out" 2> "$contract_home/park-comment.err"; contract_rc=$?
+  contract_ok=1; contract_why=""
+  [ "$contract_rc" = 0 ] && cmp -s "$contract_ledger" "$contract_home/park-comment.expected" || {
+    contract_ok=0
+    contract_why="park used a heading inside a comment"
+  }
+  report_case "$sh_bin" "parser rewrite: park ignores headings inside comments" "$contract_ok" "$contract_why"
+
+  cat > "$contract_ledger" <<'UNCLOSED_COMMENT'
+# Focus ledger
+
+## Parked (durable — carries across sessions)
+- [ ] (2023-11-01) unclosed comment target
+
+## This session (volatile — clear whenever)
+<!--
+unclosed comment
+UNCLOSED_COMMENT
+  cp "$contract_ledger" "$contract_home/unclosed.before"
+  contract_out=$(env -i HOME="$contract_home" PATH="$contract_path" "$sh_bin" \
+    "$ROOT/scripts/focus-resume.sh" 'unclosed comment target' 2> "$contract_home/unclosed.err"); contract_rc=$?
+  contract_ok=1; contract_why=""
+  [ "$contract_rc" = 4 ] && [ -z "$contract_out" ] &&
+    cmp -s "$contract_ledger" "$contract_home/unclosed.before" || {
+      contract_ok=0
+      contract_why="resume inserted inside an unclosed comment"
+    }
+  report_case "$sh_bin" "parser rewrite: unsafe unclosed comment stays unchanged" "$contract_ok" "$contract_why"
+
+  # A manual line shift after match output but before rewrite must trigger a fresh
+  # in-lock match, never move the line that inherited the old source number.
+  cp "$FIX/race.md" "$contract_ledger"
+  identity_stub=$(mktemp -d)
+  cat > "$identity_stub/awk" <<'IDENTITY_AWK'
+#!/bin/sh
+"$FOCUS_REAL_AWK" "$@"
+identity_rc=$?
+if [ "${FOCUS_PARSE_MODE:-}" = match ] && [ ! -e "$FOCUS_EDIT_ONCE" ]; then
+  : > "$FOCUS_EDIT_ONCE"
+  "$FOCUS_REAL_AWK" 'FNR == 4 { print "# concurrent external edit" } { print }' \
+    "$FOCUS_EDIT_LEDGER" > "$FOCUS_EDIT_LEDGER.edit" || exit 90
+  "$FOCUS_REAL_MV" "$FOCUS_EDIT_LEDGER.edit" "$FOCUS_EDIT_LEDGER" || exit 91
+fi
+exit "$identity_rc"
+IDENTITY_AWK
+  chmod +x "$identity_stub/awk"
+  env -i HOME="$contract_home" PATH="$identity_stub:$contract_path" \
+    FOCUS_REAL_AWK="$(command -v awk)" FOCUS_REAL_MV="$(command -v mv)" \
+    FOCUS_EDIT_ONCE="$contract_home/edit.once" FOCUS_EDIT_LEDGER="$contract_ledger" \
+    "$sh_bin" "$ROOT/scripts/focus-resume.sh" 'target race' \
+    > "$contract_home/identity.out" 2> "$contract_home/identity.err"; contract_rc=$?
+  contract_ok=1; contract_why=""
+  [ "$contract_rc" = 0 ] || { contract_ok=0; contract_why="rc=$contract_rc"; }
+  [ "$(grep -cF '# concurrent external edit' "$contract_ledger")" = 1 ] || {
+    contract_ok=0
+    contract_why="$contract_why; concurrent edit missing"
+  }
+  awk '/^## This session/{session=1; next} session && /target race item/{found=1} END{exit !found}' \
+    "$contract_ledger" || {
+      contract_ok=0
+      contract_why="$contract_why; target was not re-resolved into session"
+    }
+  report_case "$sh_bin" "resume: source-line shift forces in-lock re-resolution" "$contract_ok" "$contract_why"
+  rm -rf "$identity_stub"
+
+  # Done has its own direct no-lock mutation gate, not only resume coverage.
+  cp "$FIX/ranked.md" "$contract_ledger"; cp "$contract_ledger" "$contract_home/done-lock.before"
+  lock_stub=$(mktemp -d)
+  printf '#!/bin/sh\nexit 0\n' > "$lock_stub/sleep"; chmod +x "$lock_stub/sleep"
+  mkdir "$contract_ledger.lock" "$contract_ledger.lock.reap"
+  contract_out=$(env -i HOME="$contract_home" PATH="$lock_stub:$contract_path" "$sh_bin" \
+    "$ROOT/scripts/focus-done.sh" 'alpha beta' 2> "$contract_home/done-lock.err"); contract_rc=$?
+  rmdir "$contract_ledger.lock" "$contract_ledger.lock.reap"
+  contract_ok=1; contract_why=""
+  [ "$contract_rc" = 4 ] && [ -z "$contract_out" ] &&
+    cmp -s "$contract_ledger" "$contract_home/done-lock.before" || {
+      contract_ok=0
+      contract_why="done lock failure mutated or returned the wrong contract"
+    }
+  report_case "$sh_bin" "done: operational lock failure is unchanged" "$contract_ok" "$contract_why"
+  rm -rf "$lock_stub"
+
+  # A cooperative owner records its PID, so another caller must not reap it even
+  # after the stale-lock timeout. Once the owner releases, no lock litter remains.
+  lock_target="$contract_home/ownership-target"
+  owner_cmd='FOCUS_LIB_DIR=$1; . "$1/focus-lib.sh"; focus_lock_acquire "$2" || exit 2; : > "$3"; while [ ! -f "$4" ]; do sleep 0.05; done; focus_lock_release'
+  first_ready="$contract_home/first.ready"; first_release="$contract_home/first.release"
+  second_ready="$contract_home/second.ready"; second_release="$contract_home/second.release"
+  env -i HOME="$contract_home" PATH="$PATH" "$sh_bin" -c "$owner_cmd" lock-owner \
+    "$ROOT/scripts" "$lock_target" "$first_ready" "$first_release" & first_owner=$!
+  owner_wait=0
+  while [ ! -f "$first_ready" ] && [ "$owner_wait" -lt 100 ]; do sleep 0.05; owner_wait=$((owner_wait + 1)); done
+  env -i HOME="$contract_home" PATH="$PATH" "$sh_bin" -c "$owner_cmd" lock-contender \
+    "$ROOT/scripts" "$lock_target" "$second_ready" "$second_release" & second_owner=$!
+  wait "$second_owner"; second_owner_rc=$?
+  contract_ok=1; contract_why=""
+  [ "$second_owner_rc" = 2 ] && [ ! -f "$second_ready" ] || {
+    contract_ok=0
+    contract_why="live owner was reaped by contender"
+  }
+  [ -d "$lock_target.lock" ] && [ -f "$lock_target.lock/owner" ] || {
+    contract_ok=0
+    contract_why="$contract_why; owner lock disappeared"
+  }
+  : > "$first_release"
+  wait "$first_owner"; first_owner_rc=$?
+  [ "$first_owner_rc" = 0 ] && [ ! -e "$lock_target.lock" ] && [ ! -e "$lock_target.lock.reap" ] || {
+    contract_ok=0
+    contract_why="$contract_why; owner cleanup failed"
+  }
+  report_case "$sh_bin" "lock: live owner is never reaped" "$contract_ok" "$contract_why"
+
+  rm -rf "$contract_home" "$contract_stub"
+}
+
+run_epic3_injection_matrix() {
+  sh_bin=$1
+  command -v "$sh_bin" >/dev/null 2>&1 || return
+  injection_home=$(mktemp -d); injection_stub=$(mktemp -d); mkdir -p "$injection_home/.claude"
+  injection_ledger="$injection_home/.claude/focus-ledger.md"
+  injection_canary="$injection_home/focus_pwned"
+  make_fixed_date_stub "$injection_stub"
+  injection_path="$injection_stub:$PATH"
+  injection_ok=1; injection_why=""
+
+  sed "s#/tmp/focus_pwned#$injection_canary#g" "$FIX/injection.md" > "$injection_ledger"
+  env -i HOME="$injection_home" PATH="$injection_path" "$sh_bin" "$ROOT/hooks/focus-session-start.sh" \
+    > "$injection_home/session.out" 2> "$injection_home/session.err" || injection_ok=0
+  env -i HOME="$injection_home" PATH="$injection_path" "$sh_bin" "$ROOT/scripts/focus-list.sh" \
+    > "$injection_home/list.out" 2> "$injection_home/list.err" || injection_ok=0
+
+  sed "s#/tmp/focus_pwned#$injection_canary#g" "$FIX/injection.md" > "$injection_ledger"
+  env -i HOME="$injection_home" PATH="$injection_path" "$sh_bin" "$ROOT/scripts/focus-resume.sh" injection \
+    > "$injection_home/resume.out" 2> "$injection_home/resume.err" || injection_ok=0
+
+  sed "s#/tmp/focus_pwned#$injection_canary#g" "$FIX/injection.md" > "$injection_ledger"
+  env -i HOME="$injection_home" PATH="$injection_path" "$sh_bin" "$ROOT/scripts/focus-done.sh" injection \
+    > "$injection_home/done.out" 2> "$injection_home/done.err" || injection_ok=0
+
+  sed "s#/tmp/focus_pwned#$injection_canary#g" "$FIX/injection.md" > "$injection_ledger"
+  hostile_park='park payload $(touch '"$injection_canary"')'
+  env -i HOME="$injection_home" PATH="$injection_path" "$sh_bin" "$ROOT/scripts/focus-park.sh" "$hostile_park" \
+    > "$injection_home/park.out" 2> "$injection_home/park.err" || injection_ok=0
+
+  [ ! -e "$injection_canary" ] || {
+    injection_ok=0
+    injection_why="hostile ledger or argv text executed"
+  }
+  grep -qF '$(touch' "$injection_home/list.out" &&
+    grep -qF '$(touch' "$injection_home/resume.out" &&
+    grep -qF '$(touch' "$injection_home/done.out" &&
+    grep -qF '$(touch' "$injection_ledger" || {
+      injection_ok=0
+      injection_why="$injection_why; hostile text was not preserved as data"
+    }
+  report_case "$sh_bin" "security: every Epic 3 parser/mutator keeps hostile text inert" "$injection_ok" "$injection_why"
+  rm -rf "$injection_home" "$injection_stub"
+}
+
+run_native_snooze_check() {
+  sh_bin=$1
+  command -v "$sh_bin" >/dev/null 2>&1 || return
+  native_home=$(mktemp -d); mkdir -p "$native_home/.claude"
+  native_before=$(date +%s)
+  native_out=$(env -i HOME="$native_home" PATH="$PATH" "$sh_bin" "$ROOT/scripts/focus-snooze.sh" 4h \
+    2> "$native_home/err"); native_rc=$?
+  native_after=$(date +%s)
+  native_marker=
+  [ ! -f "$native_home/.claude/.focus-snooze" ] || native_marker=$(cat "$native_home/.claude/.focus-snooze")
+  native_text=
+  if date --version >/dev/null 2>&1; then
+    native_text=$(date -d "@$native_marker" '+%Y-%m-%d %H:%M' 2>/dev/null) || native_text=
+  else
+    native_text=$(date -r "$native_marker" '+%Y-%m-%d %H:%M' 2>/dev/null) || native_text=
+  fi
+  native_ok=1; native_why=""
+  [ "$native_rc" = 0 ] && [ ! -s "$native_home/err" ] || {
+    native_ok=0
+    native_why="rc=$native_rc or stderr not empty"
+  }
+  case $native_marker in ''|*[!0-9]*) native_ok=0; native_why="$native_why; marker is not numeric" ;; esac
+  if [ -n "$native_marker" ]; then
+    [ "$native_marker" -ge $((native_before + 14400)) ] 2>/dev/null &&
+      [ "$native_marker" -le $((native_after + 14400)) ] 2>/dev/null || {
+        native_ok=0
+        native_why="$native_why; marker is not approximately four hours ahead"
+      }
+  fi
+  [ -n "$native_text" ] && [ "$native_out" = "Nudge snoozed until $native_text." ] || {
+    native_ok=0
+    native_why="$native_why; printed timestamp does not match marker"
+  }
+  report_case "$sh_bin" "snooze: native epoch and timestamp agree within tolerance" "$native_ok" "$native_why"
+  rm -rf "$native_home"
+}
+
 main() {
   shells=${1:-}
   if [ -n "$shells" ]; then set -- "$shells"; else set -- bash dash; fi
@@ -622,6 +1487,13 @@ main() {
     run_injection_check "$s"
     run_park_check "$s"
     run_setup_check "$s"
+    run_parser_match_list_checks "$s"
+    run_mutation_checks "$s"
+    run_snooze_checks "$s"
+    run_plugin_root_checks "$s"
+    run_epic3_contract_checks "$s"
+    run_epic3_injection_matrix "$s"
+    run_native_snooze_check "$s"
   done
   echo
   echo "TOTAL: $pass passed, $fail failed"

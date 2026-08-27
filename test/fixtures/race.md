@@ -1,6 +1,6 @@
 # Focus ledger
 
 ## Parked (durable — carries across sessions)
-- [ ] (2020-01-02) injection attempt `touch /tmp/focus_pwned` $(touch /tmp/focus_pwned)
+- [ ] (2023-11-01) target race item
 
 ## This session (volatile — clear whenever)

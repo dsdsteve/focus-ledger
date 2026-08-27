@@ -1,114 +1,66 @@
 #!/bin/bash
-# focus-ledger: deterministically append ONE parked item to the ledger.
-# Called by the /focus-ledger:park command instead of an LLM freehand rewrite, so a
-# park can never drop, reorder, or reformat existing items, and concurrent parks from
-# two sessions don't clobber each other (portable mkdir mutex).
-#
-# Usage:  focus-park.sh "the thing to park"
-# Inserts `- [ ] (YYYY-MM-DD) <thing>` at the END of the "## Parked" section (before
-# the "## This session" heading), creating the ledger with both sections if absent.
-# Prints the one-line item text on success.
-#
-# On-disk artifacts beside the ledger (transient; both removed on normal exit and by
-# the signal trap): `focus-ledger.md.lock` (the mutex dir) and
-# `focus-ledger.md.lock.reap` (the reap-serialization token, see below). A crash can
-# strand them; a stranded lock is reaped automatically, a stranded reap token only
-# degrades parks to append-at-EOF (never loses items) until removed by hand.
+# focus-ledger: deterministically append one parked item to the ledger.
+# The append fallback, guarded rewrite, and hardened mkdir mutex preserve the
+# established no-loss contract under failures and concurrent sessions.
 set -eu
 
-# Fixed path so the scripts and the /focus, /resume, /snooze command prompts (which
-# reference this literal path) always agree on one ledger. Not env-overridable: a shell
-# var wouldn't reach the LLM-driven command prompts, which would split-brain the ledger.
-LEDGER="$HOME/.claude/focus-ledger.md"
-PARKED_HEAD="## Parked (durable — carries across sessions)"
-SESSION_HEAD="## This session (volatile — clear whenever)"
+SCRIPT_DIR=$(CDPATH='' cd "$(dirname "$0")" && pwd)
+if [ -n "${CLAUDE_PLUGIN_ROOT:-}" ] && [ -f "${CLAUDE_PLUGIN_ROOT}/scripts/focus-lib.sh" ]; then
+  FOCUS_LIB_DIR="${CLAUDE_PLUGIN_ROOT}/scripts"
+else
+  FOCUS_LIB_DIR=$SCRIPT_DIR
+fi
+. "$FOCUS_LIB_DIR/focus-lib.sh"
 
-# Collapse whitespace to single spaces so one item is exactly one line; then a
-# POSIX-clean emptiness check (no bashism like ${var//}, which dash rejects).
-thing=$(printf '%s' "$*" | tr '\n\t' '  ' | sed 's/  */ /g; s/^ //; s/ $//')
+thing=$(focus_normalize_text "$@")
 [ -n "$thing" ] || { echo "nothing to park (empty argument)" >&2; exit 2; }
 today=$(date +%F)
 item="- [ ] ($today) $thing"
 
-mkdir -p "$(dirname "$LEDGER")"
+mkdir -p "$(dirname "$FOCUS_LEDGER")"
 
-# Last-resort write path: one atomic O_APPEND write, no read-rewrite-mv, so it can
-# interleave with nothing and overwrite nothing. The item may land at EOF instead of
-# inside the Parked section (a later tidy verb can re-home it), but it is never lost.
+# One atomic O_APPEND write is the last-resort path. It may place an item at EOF,
+# but it cannot overwrite another session's item.
 _append_park() {
-  if [ ! -f "$LEDGER" ]; then
-    # First-ever park landing here (e.g. lock unacquirable) still writes the
-    # skeleton, so later parks keep using the structured insert instead of
-    # degrading to plain appends forever.
-    printf '# Focus ledger\n\n%s\n\n%s\n' "$PARKED_HEAD" "$SESSION_HEAD" >> "$LEDGER"
-  elif [ -s "$LEDGER" ] && [ -n "$(tail -c 1 "$LEDGER")" ]; then
-    # Hand-edited ledger without a final newline: appending would glue the item
-    # onto the last line, corrupting both and hiding the item from the
-    # line-anchored hook parsers. Restore the newline first.
-    printf '\n' >> "$LEDGER"
+  if [ ! -f "$FOCUS_LEDGER" ]; then
+    printf '# Focus ledger\n\n%s\n\n%s\n' "$FOCUS_PARKED_HEAD" "$FOCUS_SESSION_HEAD" >> "$FOCUS_LEDGER"
+  elif [ -s "$FOCUS_LEDGER" ] && [ -n "$(tail -c 1 "$FOCUS_LEDGER")" ]; then
+    printf '\n' >> "$FOCUS_LEDGER"
   fi
-  printf '%s\n' "$item" >> "$LEDGER"
+  printf '%s\n' "$item" >> "$FOCUS_LEDGER"
 }
 
 _do_park() {
-  if [ ! -f "$LEDGER" ]; then
-    printf '# Focus ledger\n\n%s\n%s\n\n%s\n' "$PARKED_HEAD" "$item" "$SESSION_HEAD" > "$LEDGER"
+  if [ ! -f "$FOCUS_LEDGER" ]; then
+    printf '# Focus ledger\n\n%s\n%s\n\n%s\n' \
+      "$FOCUS_PARKED_HEAD" "$item" "$FOCUS_SESSION_HEAD" > "$FOCUS_LEDGER"
     return
   fi
-  # Insert the item as the last line of the Parked section. If either heading is
-  # missing (hand-edited ledger), fall back to a plain append so nothing is lost.
-  # NOTE: the grep gate is a substring match but the awk below matches whole lines;
-  # a near-miss heading (extra text, trailing space) passes the gate and inserts
-  # nothing — the awk exits nonzero for that (exit !done) so we degrade to the
-  # append instead of installing a rewrite that silently dropped the item.
-  if grep -qF "$PARKED_HEAD" "$LEDGER" && grep -qF "$SESSION_HEAD" "$LEDGER"; then
+
+  # The grep gate intentionally remains a substring check. The exact shared
+  # parser match and its nonzero no-insert result protect near-miss headings.
+  if grep -qF "$FOCUS_PARKED_HEAD" "$FOCUS_LEDGER" && \
+     grep -qF "$FOCUS_SESSION_HEAD" "$FOCUS_LEDGER"; then
     tries=0
     while [ "$tries" -lt 2 ]; do
-      tries=$((tries+1))
-      pre_bytes=$(wc -c < "$LEDGER")
-      pre_lines=$(wc -l < "$LEDGER")
-      # Rewrite through a per-process temp file in the ledger's own directory:
-      # mktemp keeps concurrent parks off each other's output (the old fixed
-      # ".tmp" name was a collision), and staying in the same directory keeps
-      # the mv an atomic same-filesystem rename. On any failure, remove the
-      # temp and degrade to the append so the item is never lost.
-      tmp=$(mktemp "$LEDGER.XXXXXX" 2>/dev/null) || { _append_park; return; }
-      # Insert as the last line of the Parked block: emit the new item right before
-      # the trailing blank line(s) that precede "## This session", so the section
-      # stays tight and existing items are byte-for-byte untouched. Item and
-      # headings ride in via ENVIRON, not -v: awk -v interprets backslash escapes,
-      # so parking text with a literal \n would split into two lines. The END exit
-      # reports whether the insert actually happened.
-      if ! ITEM="$item" PH="$PARKED_HEAD" SH="$SESSION_HEAD" awk '
-        BEGIN { item=ENVIRON["ITEM"]; ph=ENVIRON["PH"]; sh=ENVIRON["SH"] }
-        $0 == ph { inpk=1 }
-        inpk && $0 == sh && !done {
-          # peel back any blank lines we already buffered, print item, then restore them
-          print item
-          for (k=1; k<=nb; k++) print ""
-          nb=0; inpk=0; done=1; print; next
-        }
-        inpk && $0 == "" { nb++; next }        # buffer blank lines inside Parked
-        { for (k=1; k<=nb; k++) print ""; nb=0; print }
-        END { for (k=1; k<=nb; k++) print ""; exit !done }
-      ' "$LEDGER" > "$tmp"; then
-        rm -f "$tmp"; _append_park; return
+      tries=$((tries + 1))
+      focus_rewrite_begin || { _append_park; return; }
+      if ! focus_rewrite_park "$item"; then
+        focus_rewrite_discard
+        _append_park
+        return
       fi
-      # Truncation guard: an insert must yield MORE lines than the source had.
-      # Some awks exit 0 on a failed/short write (e.g. disk full); never let a
-      # truncated temp replace the ledger and destroy existing items.
-      if [ "$(wc -l < "$tmp")" -le "$pre_lines" ]; then
-        rm -f "$tmp"; _append_park; return
+      if ! focus_rewrite_valid_insert; then
+        focus_rewrite_discard
+        _append_park
+        return
       fi
-      # Lost-append guard: a lockless append (another park's last resort) may have
-      # landed while we rewrote. Publishing our temp would erase it, so re-derive
-      # once from the new contents; if the file moves again, take the append path
-      # ourselves rather than risk anyone's item.
-      if [ "$(wc -c < "$LEDGER")" -ne "$pre_bytes" ]; then
-        rm -f "$tmp"; continue
-      fi
-      if mv "$tmp" "$LEDGER"; then return; fi
-      rm -f "$tmp"; _append_park; return
+      if focus_rewrite_publish; then return; fi
+      publish_rc=$?
+      focus_rewrite_discard
+      [ "$publish_rc" = 2 ] && continue
+      _append_park
+      return
     done
     _append_park
   else
@@ -116,83 +68,19 @@ _do_park() {
   fi
 }
 
-# Serialize concurrent parks with a portable mkdir-mutex (atomic on any POSIX FS;
-# flock is Linux-only and absent on macOS, so we don't rely on it). A parallel park
-# queues through a bounded primary window; if that times out, the holder is presumed
-# dead (a park killed between mkdir and rmdir), the stale lock is reaped, and we try
-# to re-acquire through a second bounded window. The rewrite path is unreachable
-# without owning the lock: if the lock still cannot be owned, the atomic append
-# above takes over — a misplaced item is acceptable, a lost one is not.
-# ponytail: mkdir-lock with a bounded ~2s+1s wait — fine for a single-user tool; if
-# you ever drive it from many concurrent sessions, move to a real lock daemon.
-# NOTE: the wait windows (20 and 10 tries at 0.1s) are load-bearing for the timing
-# in test/run.sh's contention cases — retune both together.
-LOCK="$LEDGER.lock"
-REAP="$LOCK.reap"
-locked=""
-reaping=""
-tmp=""
-
-# A signal mid-park must not strand the mutex, the reap token, or a temp file:
-# a stranded reap token would silently disable reaping for every future park.
-_cleanup() {
-  if [ -n "${tmp:-}" ]; then rm -f "$tmp" 2>/dev/null || true; fi
-  if [ -n "$locked" ]; then rmdir "$LOCK" 2>/dev/null || true; fi
-  if [ -n "$reaping" ]; then rmdir "$REAP" 2>/dev/null || true; fi
-}
-trap '_cleanup; exit 1' INT TERM HUP
-
-# Bounded lock attempt: poll mkdir every 0.1s for $1 tries; locked=1 on success.
-_try_lock() {
-  i=0
-  while [ "$i" -lt "$1" ]; do
-    if mkdir "$LOCK" 2>/dev/null; then locked=1; return 0; fi
-    sleep 0.1
-    i=$((i+1))
-  done
-  return 1
-}
-
-if ! _try_lock 20; then
-  # Timed out: reap the stale lock, then re-acquire. The reap is serialized through
-  # a token dir held until the reaper has fully finished (lock released again):
-  # without it, two parks timing out together can interleave as rmdir(A) mkdir(A)
-  # rmdir(B) — B reaping A's FRESH lock — and both would rewrite at once, the exact
-  # lost-update this script exists to prevent. A racer that cannot take the token
-  # skips reaping and just queues on the lock; mkdir stays the only arbiter.
-  if mkdir "$REAP" 2>/dev/null; then
-    reaping=1
-    rmdir "$LOCK" 2>/dev/null || true
-  fi
-  _try_lock 10 || true
-fi
-
-if [ -n "$locked" ]; then
+# Preserve the bounded 20+10 retry/reap/re-acquire mutex. Only park may use
+# the lockless append fallback; every other mutating command fails unchanged.
+if focus_lock_acquire; then
   _do_park
-  # Release only what we acquired (best-effort; ignore any error). Written as a real
-  # if/then rather than `A && B || C`, which shellcheck flags (SC2015) and which would
-  # also run the fallback when the test fails, not only when B fails.
-  rmdir "$LOCK" 2>/dev/null || true
+  focus_lock_release
 else
-  # Never rewrite unlocked — degrade to the append that cannot clobber anyone.
   _append_park
-fi
-# Hand the reap token back only after the lock is released: "token free" must imply
-# "no reap-cycle still holds the lock", so a late racer can never mistake our fresh
-# lock for the stale one it timed out on.
-if [ -n "$reaping" ]; then
-  rmdir "$REAP" 2>/dev/null || true
+  focus_lock_release
 fi
 
-# Durability gate: exit 0 must MEAN "the item is verifiably in the ledger", not
-# merely "no command in the chain happened to fail" (the 8bbe4b7 race exited 0 after
-# LOSING its item). Re-read the ledger and require the exact item line before
-# claiming success: -x whole-line, -F fixed-string, and -- so the item's leading
-# dash can't be parsed as a grep option. grep's own stderr is silenced (e.g. the
-# ledger vanished mid-park) in favor of one clear message. Written as an explicit
-# `if !` so the probe itself can't trip the active `set -e`.
-if ! grep -qxF -- "$item" "$LEDGER" 2>/dev/null; then
-  printf 'focus-park: write verification failed: item not found in %s\n' "$LEDGER" >&2
+# Exit zero is a durability claim: require the exact inserted line to be present.
+if ! grep -qxF -- "$item" "$FOCUS_LEDGER" 2>/dev/null; then
+  printf 'focus-park: write verification failed: item not found in %s\n' "$FOCUS_LEDGER" >&2
   exit 1
 fi
 

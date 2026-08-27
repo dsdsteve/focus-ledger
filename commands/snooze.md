@@ -1,21 +1,17 @@
 ---
 description: Hide the stale-thread nudge for a while (default 1 day) by writing a snooze timestamp the Stop hook respects. Use when the user says "snooze the nudge", "quiet the reminders", "stop nagging me about open threads for a bit", or wants to mute the focus stale-thread pings temporarily.
-argument-hint: [duration like 1d, 4h, 30m — default 1d]
+argument-hint: [positive duration like 1d, 4h, 30m — default 1d]
 allowed-tools: Bash
 ---
 
-Silence the focus stale-thread nudge for a while by writing a future Unix epoch to `~/.claude/.focus-snooze`. The Stop hook stays silent while that epoch is in the future.
+Snooze the stale-thread nudge through the deterministic command layer.
 
 Duration requested: $ARGUMENTS
 
-Steps:
-1. Parse the duration from the argument. Accept `Nd` (days), `Nh` (hours), `Nm` (minutes). If empty or unparseable, default to `1d`.
-2. Compute the target epoch = now + that duration. Use the Bash tool, e.g. for `4h`:
-   `echo $(( $(date +%s) + 4*3600 )) > ~/.claude/.focus-snooze`
-   (seconds per unit: d=86400, h=3600, m=60.)
-3. Confirm in one line, showing when it lifts:
-   `Nudge snoozed for <duration> (until $(date -r $(cat ~/.claude/.focus-snooze) '+%Y-%m-%d %H:%M')).`
+Pass `$ARGUMENTS` as one argv value using safe shell quoting and run `${CLAUDE_PLUGIN_ROOT}/scripts/focus-snooze.sh` with Bash. Never interpolate the duration into executable shell syntax. Retain the exit code and stdout.
 
-To un-snooze early: `rm ~/.claude/.focus-snooze`.
+- Exit 0: relay the success line exactly.
+- Exit 2: report that the duration must be a positive `Nd`, `Nh`, or `Nm`; do not claim the nudge was snoozed.
+- Any other nonzero exit: report that snoozing failed and the previous marker was left unchanged.
 
-Note: the `date -r` epoch-to-date form is BSD/macOS. On GNU/Linux use `date -d @<epoch>`.
+An empty argument defaults to `1d`. Do not compute epochs or format dates in the prompt. The script validates the duration, writes the marker safely, and handles BSD/GNU date behavior.
