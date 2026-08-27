@@ -18,7 +18,7 @@ Steps:
    - Question: "Install the focus-ledger pivot-park nudge where?"
    - Options: `Local — this project's CLAUDE.md (recommended)`, `Global — ~/.claude/CLAUDE.md, every project`, `Remove it instead`.
 
-3. **Run the bundled script** with the resolved choice:
+3. **Run the bundled script** with the resolved choice and retain its exit code and output:
 
    ```bash
    # install:
@@ -27,6 +27,21 @@ Steps:
    "${CLAUDE_PLUGIN_ROOT}/scripts/focus-setup.sh" <local|global> --remove
    ```
 
-   It backs up CLAUDE.md first, then injects/replaces the `<!-- FOCUS-LEDGER -->` block (idempotent — safe to run repeatedly). It does NOT touch hooks or settings; those are registered by the plugin itself.
+   Before rotating a backup or rewriting content, the script validates the
+   `<!-- FOCUS-LEDGER:BEGIN ... -->` / `<!-- FOCUS-LEDGER:END -->` structure.
+   Unmatched, nested, or unclosed markers refuse with exit 3, preserve file
+   content and existing backups, and print recovery guidance. The script creates
+   the parent/target (or touches an existing target) before this scan, so refusal
+   can still create the path or update its mtime. For an accepted
+   install/update/remove, it backs up `CLAUDE.md`, then injects, replaces, or
+   removes the managed block. It does NOT touch hooks or settings; the plugin
+   registers those itself.
 
-4. **Report the result in one line** from the script's output (where it wrote, and that it applies next session). Mention the block is managed — re-run `/focus-ledger:setup` to update it, or `remove` to take it out.
+4. **Report according to the exit code:**
+   - Exit 0: relay both script output lines: the install/remove result and the
+     backup/undo line. For an install, mention that it applies next session. The
+     block is managed — re-run `/focus-ledger:setup` to update it, or `remove` to
+     take it out.
+   - Exit 3: report the refusal and relay the script's recovery guidance. Do not
+     claim a backup or rewrite occurred.
+   - Any other nonzero exit: report that setup failed and do not claim success.

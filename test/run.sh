@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # focus-ledger test suite — dependency-free (no bats/shellcheck needed to run).
-# Exercises the three hooks + the park script against fixture ledgers, asserting on
-# exit code, clean stderr, and expected output. Runs each case under a chosen shell
-# so the bash/dash (Linux /bin/sh) axis is covered.
+# Exercises hook behavior and every shipped script: deterministic commands,
+# parsing/ranking, concurrency/recovery, path safety, doctor/tidy, and injection
+# guarantees. Behavioral cases run under each selected shell; repository-static
+# release consistency checks run once.
 #
 # Usage:  test/run.sh [bash|dash|sh]   (default: bash, then dash if present)
 set -u
@@ -301,9 +302,8 @@ run_injection_check() {
   sh_bin=$1
   command -v "$sh_bin" >/dev/null 2>&1 || return
   home=$(mktemp -d); mkdir -p "$home/.claude"
-  cp "$FIX/injection.md" "$home/.claude/focus-ledger.md"
   canary="$home/focus_pwned"
-  # point the payload's target into the sandbox by editing the fixture copy in place
+  # Point the payload's target into the sandbox while creating the fixture copy.
   sed "s#/tmp/focus_pwned#$canary#" "$FIX/injection.md" > "$home/.claude/focus-ledger.md"
   env -i HOME="$home" PATH="$PATH" "$sh_bin" "$ROOT/hooks/focus-stop.sh" >/dev/null 2>&1
   if [ -e "$canary" ]; then fail=$((fail+1)); printf '  FAIL [%s] SECURITY: ledger text executed (canary created)\n' "$sh_bin"
@@ -2314,9 +2314,164 @@ UNSAFE_BACKUP_MKTEMP
   rm -rf "$safe_home" "$safe_stub"
 }
 
+run_release_consistency_checks() {
+  echo "== static: release consistency =="
+
+  static_env_ok=1
+  static_env_why=""
+  static_runtime_vars=$(grep -hEo 'FOCUS_[A-Z][A-Z0-9_]*' \
+    "$ROOT"/scripts/*.sh "$ROOT"/scripts/*.awk "$ROOT"/hooks/*.sh 2>/dev/null | sort -u)
+  if [ -z "$static_runtime_vars" ]; then
+    static_env_ok=0
+    static_env_why="no runtime FOCUS_* names found"
+  fi
+  while IFS= read -r static_runtime_var; do
+    [ -n "$static_runtime_var" ] || continue
+    case $static_runtime_var in
+      FOCUS_TIDY_TEST_FAIL) continue ;; # TEST_ONLY post-verification fault seam
+    esac
+    if ! grep -qF "$static_runtime_var" "$ROOT/README.md"; then
+      static_env_ok=0
+      if [ -n "$static_env_why" ]; then
+        static_env_why="$static_env_why; README missing $static_runtime_var"
+      else
+        static_env_why="README missing $static_runtime_var"
+      fi
+    fi
+  done <<EOF_RUNTIME_VARS
+$static_runtime_vars
+EOF_RUNTIME_VARS
+  for static_public_var in FOCUS_ARCHIVE_DAYS FOCUS_NUDGE_COOLDOWN \
+    FOCUS_STALE_DAYS FOCUS_STOP_NUDGE FOCUS_WRITE_CHECK; do
+    static_table_token="| \`$static_public_var"
+    if ! grep -qF "$static_table_token" "$ROOT/README.md"; then
+      static_env_ok=0
+      if [ -n "$static_env_why" ]; then
+        static_env_why="$static_env_why; tuning table missing $static_public_var"
+      else
+        static_env_why="tuning table missing $static_public_var"
+      fi
+    fi
+  done
+  static_expected_public_vars=$(printf '%s\n' FOCUS_ARCHIVE_DAYS \
+    FOCUS_NUDGE_COOLDOWN FOCUS_STALE_DAYS FOCUS_STOP_NUDGE FOCUS_WRITE_CHECK | sort -u)
+  static_table_public_vars=$(awk -F '`' '
+    /^\| `FOCUS_[A-Z0-9_]+/ {
+      name=$2
+      sub(/[=<].*$/, "", name)
+      print name
+    }
+  ' "$ROOT/README.md" | sort -u)
+  if [ "$static_table_public_vars" != "$static_expected_public_vars" ]; then
+    static_env_ok=0
+    if [ -n "$static_env_why" ]; then
+      static_env_why="$static_env_why; tuning table public set differs"
+    else
+      static_env_why="tuning table public set differs"
+    fi
+  fi
+  report_case static "release: runtime FOCUS_* contract is documented" \
+    "$static_env_ok" "$static_env_why"
+
+  static_commands_ok=1
+  static_commands_why=""
+  static_command_count=0
+  static_command_names=""
+  for static_command_file in "$ROOT"/commands/*.md; do
+    [ -f "$static_command_file" ] || continue
+    static_command_count=$((static_command_count + 1))
+    static_command_name=${static_command_file##*/}
+    static_command_name=${static_command_name%.md}
+    static_command_names="$static_command_names
+$static_command_name"
+    if ! grep -qF -- "- **\`/focus-ledger:$static_command_name" "$ROOT/README.md"; then
+      static_commands_ok=0
+      static_commands_why="$static_commands_why; $static_command_name missing from command list"
+    fi
+    if ! grep -qF -- "\`/focus-ledger:$static_command_name\` |" "$ROOT/README.md"; then
+      static_commands_ok=0
+      static_commands_why="$static_commands_why; $static_command_name missing from trigger table"
+    fi
+    case $static_command_name in
+      focus) static_command_script="$ROOT/scripts/focus-list.sh" ;;
+      *) static_command_script="$ROOT/scripts/focus-$static_command_name.sh" ;;
+    esac
+    static_command_rel=${static_command_script#"$ROOT/"}
+    if [ ! -x "$static_command_script" ]; then
+      static_commands_ok=0
+      static_commands_why="$static_commands_why; $static_command_rel missing or not executable"
+    elif ! grep -qF "\${CLAUDE_PLUGIN_ROOT}/$static_command_rel" "$static_command_file"; then
+      static_commands_ok=0
+      static_commands_why="$static_commands_why; $static_command_name does not reference $static_command_rel"
+    fi
+  done
+  if [ "$static_command_count" -eq 0 ]; then
+    static_commands_ok=0
+    static_commands_why="no command files found"
+  fi
+  static_readme_commands=$(grep -E '(^- \*\*`/focus-ledger:|^\|.*`/focus-ledger:)' \
+    "$ROOT/README.md" | grep -Eo '/focus-ledger:[a-z-]+' | \
+    sed 's#^/focus-ledger:##' | sort -u)
+  while IFS= read -r static_readme_command; do
+    [ -n "$static_readme_command" ] || continue
+    if [ ! -f "$ROOT/commands/$static_readme_command.md" ]; then
+      static_commands_ok=0
+      static_commands_why="$static_commands_why; README lists unknown command $static_readme_command"
+    fi
+  done <<EOF_README_COMMANDS
+$static_readme_commands
+EOF_README_COMMANDS
+  static_readme_command_count=$(printf '%s\n' "$static_readme_commands" | \
+    awk 'NF { count++ } END { print count + 0 }')
+  if [ "$static_readme_command_count" -ne "$static_command_count" ]; then
+    static_commands_ok=0
+    static_commands_why="$static_commands_why; README/file command counts differ ($static_readme_command_count/$static_command_count)"
+  fi
+  : "$static_command_names"
+  report_case static "release: command files, README sections, and scripts agree" \
+    "$static_commands_ok" "${static_commands_why#; }"
+
+  static_plugin_version=$(awk -F '"' '/"version"[[:space:]]*:/ { print $4; exit }' \
+    "$ROOT/.claude-plugin/plugin.json")
+  static_marketplace_version=$(awk -F '"' '/"version"[[:space:]]*:/ { print $4; exit }' \
+    "$ROOT/.claude-plugin/marketplace.json")
+  static_changelog_version=$(sed -n 's/^## \[\([^]]*\)\].*/\1/p' \
+    "$ROOT/CHANGELOG.md" | sed -n '1p')
+  static_readme_version=$(sed -n 's/^\*\*Current release:\*\* `\([^`]*\)`.*/\1/p' \
+    "$ROOT/README.md" | sed -n '1p')
+  static_version_ok=1
+  static_version_why=""
+  if [ "$static_plugin_version" != 1.2.0 ] ||
+     [ "$static_marketplace_version" != 1.2.0 ] ||
+     [ "$static_changelog_version" != 1.2.0 ] ||
+     [ "$static_readme_version" != 1.2.0 ]; then
+    static_version_ok=0
+    static_version_why="plugin=$static_plugin_version marketplace=$static_marketplace_version changelog=$static_changelog_version README=$static_readme_version"
+  elif ! grep -qi 'opt-in' "$ROOT/README.md" ||
+       ! grep -qi 'opt-in' "$ROOT/CHANGELOG.md"; then
+    static_version_ok=0
+    static_version_why="opt-in write-nudge change missing from README or CHANGELOG"
+  fi
+  report_case static "release: metadata, README, and CHANGELOG agree on 1.2.0" \
+    "$static_version_ok" "$static_version_why"
+
+  static_exec_ok=1
+  static_exec_why=""
+  for static_exec_path in "$ROOT"/scripts/*.sh "$ROOT"/hooks/*.sh "$ROOT/test/run.sh"; do
+    if [ ! -x "$static_exec_path" ]; then
+      static_exec_ok=0
+      static_exec_why="$static_exec_why; ${static_exec_path#"$ROOT/"} is not executable"
+    fi
+  done
+  report_case static "release: shipped scripts remain executable" \
+    "$static_exec_ok" "${static_exec_why#; }"
+}
+
 main() {
   shells=${1:-}
   if [ -n "$shells" ]; then set -- "$shells"; else set -- bash dash; fi
+  # Repository-static release checks are shell-independent and run once.
+  run_release_consistency_checks
   for s in "$@"; do
     run_suite "$s"
     run_injection_check "$s"

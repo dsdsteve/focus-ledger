@@ -10,19 +10,22 @@ The thing to park: $ARGUMENTS
 
 Steps:
 1. If `$ARGUMENTS` is empty, ask what to park (one line) and stop — don't run the script with no argument.
-2. Trim the thing to its essence (a short phrase, not a pasted paragraph), then append it by running the bundled script — this is a deterministic insert that can't drop, reorder, or reformat existing items:
+2. Trim the thing to its essence (a short phrase, not a pasted paragraph), then run the bundled writer and retain its exit code and stdout:
 
    ```bash
    "${CLAUDE_PLUGIN_ROOT}/scripts/focus-park.sh" "<the trimmed thing>"
    ```
 
-   The script stamps today's date, inserts `- [ ] (YYYY-MM-DD) <thing>` at the end of the Parked section, and creates the ledger (with both sections) if it doesn't exist yet. Do NOT hand-edit the ledger file for a park — always go through the script, so concurrent sessions and existing items stay safe.
+   The script stamps today's date, inserts `- [ ] (YYYY-MM-DD) <thing>` in the Parked section when guarded rewriting is available, and creates the ledger with both sections if it does not exist. Its no-loss fallback can append at EOF when safe structured publication cannot be proven. Do NOT hand-edit the ledger for a park.
+3. Report according to the exit code:
+   - Exit 0: stdout is the normalized item. Answer with `<stdout> — parked. (Carries over to next session; /focus-ledger:resume to pull it back.)`
+   - Exit 1: say the write could not be verified and do not claim the item was parked. An identical line may already be present, so suggest checking `/focus-ledger:focus` or `/focus-ledger:doctor` before retrying.
+   - Exit 2: ask for a non-empty item and do not claim success.
+   - Any other nonzero exit: report that parking failed and do not claim success.
 
-Output (answer-first), using the phrase you passed:
-- One line, leading with the item: `<thing> — parked. (Carries over to next session; /focus-ledger:resume to pull it back.)`
-- No preamble, no commentary on why they're parking it.
+Use no preamble on success and do not add commentary about why the user is parking it.
 
 **Example:**
 Input: `investigate the flaky login test`
 Runs: `"${CLAUDE_PLUGIN_ROOT}/scripts/focus-park.sh" "investigate the flaky login test"`
-Output: `investigate the flaky login test — parked. (Carries over to next session; /focus-ledger:resume to pull it back.)`
+Exit 0 output: `investigate the flaky login test — parked. (Carries over to next session; /focus-ledger:resume to pull it back.)`

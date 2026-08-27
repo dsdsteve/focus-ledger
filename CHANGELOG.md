@@ -4,6 +4,60 @@ All notable changes to focus-ledger are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/); this project uses
 [semantic versioning](https://semver.org/).
 
+## [1.2.0] — 2026-08-25
+
+### Added
+- Deterministic `focus-list.sh` and shared format-v1 parsing provide
+  calendar-day ranking and safe TSV output; `resume` and `done` add explicit
+  unique/no-match/ambiguity contracts; `snooze` validates and formats portable
+  durations without model-side epoch arithmetic.
+- Read-only `doctor` diagnostics for ledger structure, malformed records,
+  setup markers, locks, markers, and adjacent artifacts.
+- Report-confirm-apply `tidy` maintenance: verified archival of eligible
+  completed records, session-item promotion, misplaced-open-item re-homing,
+  expired marker cleanup, conservative stale-temp cleanup, and retained ledger
+  recovery backups.
+- Stop-hook cooldown state through `FOCUS_NUDGE_COOLDOWN` (default four hours),
+  plus `FOCUS_ARCHIVE_DAYS` (default 30) for tidy eligibility.
+
+### Changed
+- The PreToolUse write nudge is now opt-in. `FOCUS_WRITE_CHECK=on` emits the
+  soft note, `strict` asks through the ordinary permission flow, and unset,
+  `off`, or other values are silent. Existing users who want the previous note
+  must set `on`; there is no ledger migration. Default silence keeps an optional
+  writing aid from appearing unless the user deliberately enables it.
+- Command prompts now delegate ranking, matching, date math, mutation, and
+  maintenance to bundled scripts instead of editing or interpreting ledger
+  state freehand.
+
+### Fixed
+- Park no longer loses concurrent items around stale/slow locks or the
+  append-versus-rename publication window, and status 0 now requires the exact
+  dated line to be observable after writing.
+- Setup validates managed-block markers before backup rotation or content
+  rewrite, refusing malformed structures with status 3 instead of risking
+  deletion of following user content.
+- Resume and completion mutate only a unique current match under the shared
+  lock and leave the ledger unchanged for no-match, ambiguity, or unverified
+  publication paths.
+- Stop removes an expired numeric snooze marker before ordinary stale-item
+  evaluation and rate-limits repeated stale notices with the cooldown marker.
+- Epic 1's park-concurrency, truthful-exit, and setup data-loss fixes are
+  source-compatible with a separately maintained `1.1.2` patch and can be
+  cherry-picked together for that purpose. The project has not published that
+  back-port and supports fixes on the latest release.
+
+### Security
+- Ledger-controlled text remains inert across list, match, SessionStart, Stop,
+  doctor, and tidy; parser inputs use environment data and command prompts relay
+  escaped TSV rather than executing returned fields.
+- Marker publication replaces unsafe destination types without following them;
+  doctor reports unsafe paths read-only, and tidy refuses unsafe ledger,
+  archive, marker, backup, or cleanup targets before applying.
+- Tidy stages and post-verifies exact raw-record multisets, quarantines volatile
+  deletions until verification succeeds, and attempts rollback from verified
+  backups on handled failures.
+
 ## [1.1.1] — 2026-07-09
 
 ### Fixed
