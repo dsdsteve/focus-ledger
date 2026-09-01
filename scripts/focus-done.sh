@@ -15,7 +15,14 @@ if [ -z "$query" ]; then
   printf 'usage: focus-done.sh <rank-or-words>\n' >&2
   exit 2
 fi
-[ -f "$FOCUS_LEDGER" ] || exit 1
+if focus_ledger_path_status; then
+  :
+else
+  ledger_path_rc=$?
+  [ "$ledger_path_rc" = 1 ] && exit 1
+  printf 'focus-done: unsafe ledger path: %s\n' "$FOCUS_LEDGER" >&2
+  exit 4
+fi
 
 if ! focus_lock_acquire; then
   focus_lock_release
@@ -90,8 +97,9 @@ while [ "$attempt" -lt 2 ]; do
     focus_lock_release
     printf '%s\n' "$match_output"
     exit 0
+  else
+    publish_rc=$?
   fi
-  publish_rc=$?
   focus_rewrite_discard
   [ "$publish_rc" = 2 ] && continue
   focus_lock_release

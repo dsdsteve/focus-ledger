@@ -15,7 +15,18 @@ else
 fi
 
 focus_normalize_text() {
-  printf '%s' "$*" | tr '\n\t' '  ' | sed 's/  */ /g; s/^ //; s/ $//'
+  printf '%s' "$*" | LC_ALL=C tr '\000-\037\177' ' ' | sed 's/  */ /g; s/^ //; s/ $//'
+}
+
+# Return 0 only for an existing regular ledger, 1 for genuine absence, and 2
+# for every existing unsafe type. Check symlinks first so a dangling link can
+# never masquerade as a missing ledger and a live link is never followed.
+focus_ledger_path_status() {
+  focus_ledger_check_path=${1:-$FOCUS_LEDGER}
+  [ ! -L "$focus_ledger_check_path" ] || return 2
+  [ -e "$focus_ledger_check_path" ] || return 1
+  [ -f "$focus_ledger_check_path" ] || return 2
+  return 0
 }
 
 focus_is_safe_epoch() {
@@ -166,7 +177,13 @@ focus_parse_stale() {
 }
 
 focus_list_items() {
-  [ -f "$FOCUS_LEDGER" ] || return 0
+  if focus_ledger_path_status; then
+    :
+  else
+    focus_list_path_rc=$?
+    [ "$focus_list_path_rc" = 1 ] && return 0
+    return 2
+  fi
   focus_parser_ready || return 2
   focus_list_today=$(focus_today_days) || return 2
   focus_list_threshold=$(focus_stale_threshold)
@@ -269,7 +286,13 @@ focus_match() {
   focus_match_query=$(focus_normalize_text "$1")
   focus_match_eligible=${2:-all}
   [ -n "$focus_match_query" ] || return 1
-  [ -f "$FOCUS_LEDGER" ] || return 1
+  if focus_ledger_path_status; then
+    :
+  else
+    focus_match_path_rc=$?
+    [ "$focus_match_path_rc" = 1 ] && return 1
+    return 2
+  fi
   focus_parser_ready || return 2
   focus_match_today=$(focus_today_days) || return 2
   focus_match_threshold=$(focus_stale_threshold)
@@ -341,6 +364,10 @@ FOCUS_REAP_TOKEN=
 FOCUS_LOCKED=
 FOCUS_REAPING=
 FOCUS_WRITE_GATE=
+focus_lock_attempts_used=0
+focus_stale_owner_present=
+focus_stale_owner_token=
+focus_pending_claim=
 FOCUS_TMP=
 FOCUS_TRIM=
 FOCUS_PRE_BYTES=
@@ -357,15 +384,38 @@ focus_lock_dir_owned() {
   [ "$focus_recorded_token" = "$focus_owned_token" ]
 }
 
+focus_lock_drop_pending_claim() {
+  focus_pending_path=$1
+  focus_pending_token=$2
+  focus_pending_recorded=
+  [ -f "$focus_pending_path" ] && [ ! -L "$focus_pending_path" ] || return 0
+  IFS= read -r focus_pending_recorded < "$focus_pending_path" || return 0
+  [ "$focus_pending_recorded" = "$focus_pending_token" ] || return 0
+  rm -f "$focus_pending_path" 2>/dev/null || true
+}
+
 focus_lock_claim_dir() {
   focus_claim_dir=$1
   focus_claim_token=$2
-  mkdir "$focus_claim_dir" 2>/dev/null || return 1
-  if (umask 077; printf '%s\n' "$focus_claim_token" > "$focus_claim_dir/owner") 2>/dev/null; then
+  focus_pending_claim="$focus_claim_dir.claim.$$"
+  if ! (umask 077; set -C; printf '%s\n' "$focus_claim_token" > "$focus_pending_claim") 2>/dev/null; then
+    focus_pending_claim=
+    return 1
+  fi
+  if ! mkdir "$focus_claim_dir" 2>/dev/null; then
+    focus_lock_drop_pending_claim "$focus_pending_claim" "$focus_claim_token"
+    focus_pending_claim=
+    return 1
+  fi
+  if (umask 077; set -C; printf '%s\n' "$focus_claim_token" > "$focus_claim_dir/owner") 2>/dev/null; then
+    focus_lock_drop_pending_claim "$focus_pending_claim" "$focus_claim_token"
+    focus_pending_claim=
     return 0
   fi
   rm -f "$focus_claim_dir/owner" 2>/dev/null || true
   rmdir "$focus_claim_dir" 2>/dev/null || true
+  focus_lock_drop_pending_claim "$focus_pending_claim" "$focus_claim_token"
+  focus_pending_claim=
   return 1
 }
 
@@ -377,13 +427,129 @@ focus_lock_drop_owned_dir() {
   rmdir "$focus_drop_dir" 2>/dev/null || true
 }
 
-focus_lock_reap_dir() {
+# Return success only when a library-owned directory records a live PID.
+focus_lock_dir_owner_alive() {
+  focus_owner_dir=$1
+  focus_owner_prefix=$2
+  focus_owner_token=
+  [ -f "$focus_owner_dir/owner" ] && [ ! -L "$focus_owner_dir/owner" ] || return 1
+  IFS= read -r focus_owner_token < "$focus_owner_dir/owner" || return 1
+  case $focus_owner_token in
+    "$focus_owner_prefix".*) focus_owner_pid=${focus_owner_token#*.} ;;
+    *) return 1 ;;
+  esac
+  case $focus_owner_pid in
+    ''|*[!0-9]*) return 1 ;;
+  esac
+  kill -0 "$focus_owner_pid" 2>/dev/null
+}
+
+# A claimant publishes this sibling token before mkdir, closing the otherwise
+# unavoidable interval between creating a lock directory and its owner file.
+focus_lock_pending_claim_alive() {
+  focus_pending_dir=$1
+  focus_pending_prefix=$2
+  for focus_pending_path in "$focus_pending_dir".claim.*; do
+    [ -f "$focus_pending_path" ] && [ ! -L "$focus_pending_path" ] || continue
+    focus_pending_token=
+    IFS= read -r focus_pending_token < "$focus_pending_path" || continue
+    case $focus_pending_token in
+      "$focus_pending_prefix".*) focus_pending_pid=${focus_pending_token#*.} ;;
+      *) continue ;;
+    esac
+    case $focus_pending_pid in ''|*[!0-9]*) continue ;; esac
+    kill -0 "$focus_pending_pid" 2>/dev/null && return 0
+  done
+  return 1
+}
+
+focus_lock_prune_dead_claims() {
+  focus_pending_dir=$1
+  focus_pending_prefix=$2
+  for focus_pending_path in "$focus_pending_dir".claim.*; do
+    [ -f "$focus_pending_path" ] && [ ! -L "$focus_pending_path" ] || continue
+    focus_pending_token=
+    IFS= read -r focus_pending_token < "$focus_pending_path" || continue
+    case $focus_pending_token in
+      "$focus_pending_prefix".*) focus_pending_pid=${focus_pending_token#*.} ;;
+      *) continue ;;
+    esac
+    case $focus_pending_pid in ''|*[!0-9]*) continue ;; esac
+    kill -0 "$focus_pending_pid" 2>/dev/null || rm -f "$focus_pending_path" 2>/dev/null || true
+  done
+}
+
+# Snapshot a stale owner before reaping it. A freshly-created lock directory can
+# briefly lack its owner file, so confirm that state once after a short wait.
+# Symlinked or non-regular owner entries are never removed.
+focus_lock_stale_snapshot() {
+  focus_stale_check_dir=$1
+  focus_stale_check_prefix=$2
+  focus_stale_owner_present=
+  focus_stale_owner_token=
+  [ -d "$focus_stale_check_dir" ] && [ ! -L "$focus_stale_check_dir" ] || return 1
+  if focus_lock_pending_claim_alive "$focus_stale_check_dir" "$focus_stale_check_prefix"; then
+    return 1
+  fi
+  if focus_lock_dir_owner_alive "$focus_stale_check_dir" "$focus_stale_check_prefix"; then
+    return 1
+  fi
+  if [ ! -e "$focus_stale_check_dir/owner" ] && [ ! -L "$focus_stale_check_dir/owner" ]; then
+    sleep 0.1
+    [ -d "$focus_stale_check_dir" ] && [ ! -L "$focus_stale_check_dir" ] || return 1
+    if focus_lock_pending_claim_alive "$focus_stale_check_dir" "$focus_stale_check_prefix"; then
+      return 1
+    fi
+    if focus_lock_dir_owner_alive "$focus_stale_check_dir" "$focus_stale_check_prefix"; then
+      return 1
+    fi
+  fi
+  [ ! -L "$focus_stale_check_dir/owner" ] || return 1
+  if [ -e "$focus_stale_check_dir/owner" ]; then
+    [ -f "$focus_stale_check_dir/owner" ] && [ -r "$focus_stale_check_dir/owner" ] || return 1
+    focus_stale_check_token=
+    IFS= read -r focus_stale_check_token < "$focus_stale_check_dir/owner" ||
+      [ -n "$focus_stale_check_token" ] || true
+    case $focus_stale_check_token in
+      "$focus_stale_check_prefix".*)
+        focus_stale_check_pid=${focus_stale_check_token#*.}
+        case $focus_stale_check_pid in
+          ''|*[!0-9]*) ;;
+          *) kill -0 "$focus_stale_check_pid" 2>/dev/null && return 1 ;;
+        esac
+        ;;
+    esac
+    focus_stale_owner_present=1
+    focus_stale_owner_token=$focus_stale_check_token
+  fi
+  focus_lock_prune_dead_claims "$focus_stale_check_dir" "$focus_stale_check_prefix"
+  return 0
+}
+
+# Remove only the exact stale state captured above. In particular, an owner
+# published after an ownerless snapshot makes rmdir fail rather than being
+# deleted out from under its live claimant.
+focus_lock_reap_snapshot() {
   focus_stale_dir=$1
-  rm -f "$focus_stale_dir/owner" 2>/dev/null || true
-  rmdir "$focus_stale_dir" 2>/dev/null || true
+  if [ -n "${focus_stale_owner_present:-}" ]; then
+    focus_stale_current_token=
+    [ -f "$focus_stale_dir/owner" ] && [ ! -L "$focus_stale_dir/owner" ] &&
+      [ -r "$focus_stale_dir/owner" ] || return 1
+    IFS= read -r focus_stale_current_token < "$focus_stale_dir/owner" ||
+      [ -n "$focus_stale_current_token" ] || true
+    [ "$focus_stale_current_token" = "$focus_stale_owner_token" ] || return 1
+    rm -f "$focus_stale_dir/owner" 2>/dev/null || return 1
+  else
+    [ ! -e "$focus_stale_dir/owner" ] && [ ! -L "$focus_stale_dir/owner" ] || return 1
+  fi
+  rmdir "$focus_stale_dir" 2>/dev/null
 }
 
 focus_lock_cleanup() {
+  if [ -n "${focus_pending_claim:-}" ]; then
+    focus_lock_drop_pending_claim "$focus_pending_claim" "${focus_claim_token:-}"
+    focus_pending_claim=
+  fi
   if [ -n "${FOCUS_TRIM:-}" ]; then rm -f "$FOCUS_TRIM" 2>/dev/null || true; fi
   if [ -n "${FOCUS_TMP:-}" ]; then rm -f "$FOCUS_TMP" 2>/dev/null || true; fi
   if [ -n "${FOCUS_LOCKED:-}" ]; then
@@ -413,10 +579,12 @@ focus_lock_prepare() {
   trap 'focus_lock_cleanup; exit 1' INT TERM HUP
 }
 
-# Poll mkdir every 0.1s for the requested number of attempts.
+# Poll mkdir every 0.1s for the requested number of attempts and expose the
+# consumed attempts so callers can share one wall-clock budget across locks.
 focus_try_lock() {
   focus_lock_i=0
   while [ "$focus_lock_i" -lt "$1" ]; do
+    focus_lock_attempts_used=$((focus_lock_attempts_used + 1))
     FOCUS_LOCKED=maybe
     if focus_lock_claim_dir "$FOCUS_LOCK" "$FOCUS_LOCK_TOKEN"; then
       FOCUS_LOCKED=1
@@ -429,41 +597,41 @@ focus_try_lock() {
   return 1
 }
 
-# Return success only when a library-owned directory records a live PID.
-focus_lock_dir_owner_alive() {
-  focus_owner_dir=$1
-  focus_owner_prefix=$2
-  focus_owner_token=
-  [ -f "$focus_owner_dir/owner" ] && [ ! -L "$focus_owner_dir/owner" ] || return 1
-  IFS= read -r focus_owner_token < "$focus_owner_dir/owner" || return 1
-  case $focus_owner_token in
-    "$focus_owner_prefix".*) focus_owner_pid=${focus_owner_token#*.} ;;
-    *) return 1 ;;
-  esac
-  case $focus_owner_pid in
-    ''|*[!0-9]*) return 1 ;;
-  esac
-  kill -0 "$focus_owner_pid" 2>/dev/null
-}
-
 # A lock created by this library records its shell PID. Cooperative live owners
 # are never reaped; legacy/empty locks and owners whose process exited remain stale.
 focus_lock_owner_alive() {
   focus_lock_dir_owner_alive "$FOCUS_LOCK" lock
 }
 
-# Preserve park's hardened mutex: primary bounded wait, serialized stale-lock
-# reap, then a second bounded re-acquire window. Ownership tokens ensure a slow
-# live owner is not reaped and can never remove a successor during late cleanup.
+# Preserve the default 20+10 retry/reap/re-acquire mutex while allowing hooks to
+# pass a smaller shared attempt budget. Ownerless legacy locks are confirmed
+# before a serialized reap, and every path remains bounded.
 focus_lock_acquire() {
+  focus_lock_total_attempts=${2:-30}
+  case $focus_lock_total_attempts in
+    ''|*[!0-9]*) focus_lock_total_attempts=30 ;;
+  esac
+  if [ "$focus_lock_total_attempts" -gt 20 ]; then
+    focus_lock_primary_attempts=20
+  elif [ "$focus_lock_total_attempts" -gt 1 ]; then
+    focus_lock_primary_attempts=$((focus_lock_total_attempts / 2))
+  else
+    focus_lock_primary_attempts=$focus_lock_total_attempts
+  fi
+  focus_lock_secondary_attempts=$((focus_lock_total_attempts - focus_lock_primary_attempts))
+
   focus_lock_prepare "${1:-$FOCUS_LEDGER}"
-  if focus_try_lock 20; then return 0; fi
-  if ! focus_lock_owner_alive && focus_lock_claim_dir "$FOCUS_REAP" "$FOCUS_REAP_TOKEN"; then
+  focus_lock_attempts_used=0
+  if focus_try_lock "$focus_lock_primary_attempts"; then return 0; fi
+  if focus_lock_stale_snapshot "$FOCUS_LOCK" lock &&
+     focus_lock_claim_dir "$FOCUS_REAP" "$FOCUS_REAP_TOKEN"; then
     FOCUS_REAPING=1
     # Re-check after serializing reapers; an owner may have changed while waiting.
-    if ! focus_lock_owner_alive; then focus_lock_reap_dir "$FOCUS_LOCK"; fi
+    if focus_lock_stale_snapshot "$FOCUS_LOCK" lock; then
+      focus_lock_reap_snapshot "$FOCUS_LOCK" || true
+    fi
   fi
-  focus_try_lock 10 || true
+  focus_try_lock "$focus_lock_secondary_attempts" || true
   [ -n "$FOCUS_LOCKED" ]
 }
 
@@ -482,7 +650,12 @@ focus_lock_release() {
 # The existing reap token doubles as a publication gate. This serializes the
 # lockless park fallback with the checksum+rename step used by guarded rewrites:
 # append-before-publish forces a retry; publish-before-append targets the new file.
+# The default 80 polls cap the wait at roughly four seconds.
 focus_write_gate_acquire() {
+  focus_gate_limit=${1:-80}
+  case $focus_gate_limit in
+    ''|*[!0-9]*) focus_gate_limit=80 ;;
+  esac
   FOCUS_WRITE_GATE=
   if [ -n "${FOCUS_REAPING:-}" ] &&
      focus_lock_dir_owned "$FOCUS_REAP" "$FOCUS_REAP_TOKEN"; then
@@ -490,23 +663,21 @@ focus_write_gate_acquire() {
     return 0
   fi
 
-  while :; do
+  focus_gate_i=0
+  while [ "$focus_gate_i" -lt "$focus_gate_limit" ]; do
     if focus_lock_claim_dir "$FOCUS_REAP" "$FOCUS_REAP_TOKEN"; then
       FOCUS_REAPING=1
       FOCUS_WRITE_GATE=owned
       return 0
     fi
-    if [ ! -f "$FOCUS_REAP/owner" ] || [ -L "$FOCUS_REAP/owner" ]; then
-      # An unmanaged reap token blocks all cooperative publishers. Callers may
-      # use the append-only path, but guarded renames must fail unchanged.
-      return 2
-    fi
-    if focus_lock_dir_owner_alive "$FOCUS_REAP" reap; then
+    if focus_lock_stale_snapshot "$FOCUS_REAP" reap; then
+      focus_lock_reap_snapshot "$FOCUS_REAP" || true
+    else
       sleep 0.05
-      continue
     fi
-    focus_lock_reap_dir "$FOCUS_REAP"
+    focus_gate_i=$((focus_gate_i + 1))
   done
+  return 1
 }
 
 focus_write_gate_release() {
@@ -518,6 +689,7 @@ focus_write_gate_release() {
 }
 
 focus_rewrite_begin() {
+  focus_ledger_path_status || return 1
   FOCUS_PRE_BYTES=$(wc -c < "$FOCUS_LEDGER") || return 1
   FOCUS_PRE_LINES=$(wc -l < "$FOCUS_LEDGER") || return 1
   FOCUS_PRE_CKSUM=$(cksum < "$FOCUS_LEDGER") || return 1
@@ -578,6 +750,7 @@ focus_rewrite_preserve_eof() {
 }
 
 focus_rewrite_source_unchanged() {
+  focus_ledger_path_status || return 1
   [ "$(cksum < "$FOCUS_LEDGER")" = "$FOCUS_PRE_CKSUM" ]
 }
 

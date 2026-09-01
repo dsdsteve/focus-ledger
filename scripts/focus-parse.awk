@@ -24,6 +24,10 @@ BEGIN {
   diagnostic_section = "outside"
   tab_char = sprintf("%c", 9)
   carriage_char = sprintf("%c", 13)
+  for (control_code = 1; control_code <= 31; control_code++) {
+    ascii_control[sprintf("%c", control_code)] = 1
+  }
+  ascii_control[sprintf("%c", 127)] = 1
   numeric_query = (query ~ /^[0-9]+$/)
   canonical_rank = query
   if (numeric_query) {
@@ -60,7 +64,7 @@ function leap_year(y) {
 }
 
 function valid_calendar_date(y, m, d,   max_day) {
-  if (m < 1 || m > 12 || d < 1) return 0
+  if (y < 1 || m < 1 || m > 12 || d < 1) return 0
   if (m == 2) max_day = leap_year(y) ? 29 : 28
   else if (m == 4 || m == 6 || m == 9 || m == 11) max_day = 30
   else max_day = 31
@@ -88,6 +92,7 @@ function parse_valid_open(line) {
   parsed_days = calendar_days(parsed_date)
   if (!calendar_valid) return 0
   parsed_text = substr(line, 20)
+  if (parsed_text !~ /[^[:space:]]/) return 0
   return 1
 }
 
@@ -100,6 +105,7 @@ function parse_valid_done(line) {
   parsed_days = calendar_days(parsed_date)
   if (!calendar_valid) return 0
   parsed_text = substr(line, 20)
+  if (parsed_text !~ /[^[:space:]]/) return 0
   return 1
 }
 
@@ -187,8 +193,8 @@ function comment_record(line) {
 }
 
 # Keep TSV records structurally safe without evaluating or dropping user text.
-# Backslash, tab, and carriage return get visible escapes; remaining controls are
-# represented by a question mark. Record newlines are supplied only by printf.
+# Backslash, tab, and carriage return get visible escapes; every remaining ASCII
+# control is represented by a question mark. Record newlines come only from printf.
 function tsv_escape(value,   result, i, ch) {
   result = ""
   for (i = 1; i <= length(value); i++) {
@@ -196,7 +202,19 @@ function tsv_escape(value,   result, i, ch) {
     if (ch == "\\") result = result "\\\\"
     else if (ch == tab_char) result = result "\\t"
     else if (ch == carriage_char) result = result "\\r"
-    else if (ch ~ /[[:cntrl:]]/) result = result "?"
+    else if (ch in ascii_control) result = result "?"
+    else result = result ch
+  }
+  return result
+}
+
+# Human-facing hook text keeps ordinary bytes unchanged but cannot carry raw
+# ASCII controls into a systemMessage.
+function display_escape(value,   result, i, ch) {
+  result = ""
+  for (i = 1; i <= length(value); i++) {
+    ch = substr(value, i, 1)
+    if (ch in ascii_control) result = result "?"
     else result = result ch
   }
   return result
@@ -322,14 +340,21 @@ function flush_rewrite_blanks(   blank_i) {
   is_comment = comment_record($0)
 
   if (mode == "park-insert") {
-    if (!is_comment && $0 == parked_head) rewrite_in_parked = 1
-    if (!is_comment && rewrite_in_parked && $0 == session_head && !rewrite_done) {
-      print rewrite_item
-      flush_rewrite_blanks()
+    if (!is_comment && $0 == parked_head && !rewrite_parked_seen) {
+      rewrite_parked_seen = 1
+      rewrite_in_parked = 1
+    } else if (!is_comment && rewrite_in_parked && /^## /) {
+      if ($0 == session_head && !rewrite_done) {
+        print rewrite_item
+        flush_rewrite_blanks()
+        rewrite_in_parked = 0
+        rewrite_done = 1
+        print
+        next
+      }
+      # Never insert across another real section or a duplicate Parked heading.
+      rewrite_blocked = 1
       rewrite_in_parked = 0
-      rewrite_done = 1
-      print
-      next
     }
     if (rewrite_in_parked && $0 == "") {
       rewrite_blank_count++
@@ -515,7 +540,7 @@ mode == "stale" && (exact_section == "parked" || exact_section == "session") && 
     stale_count++
     if (stale_count <= 3) {
       if (stale_count > 1) stale_summary = stale_summary "; "
-      stale_summary = stale_summary parsed_text
+      stale_summary = stale_summary display_escape(parsed_text)
     }
   }
   next

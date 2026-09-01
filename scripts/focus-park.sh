@@ -17,42 +17,68 @@ thing=$(focus_normalize_text "$@")
 today=$(date +%F)
 item="- [ ] ($today) $thing"
 
-mkdir -p "$(dirname "$FOCUS_LEDGER")"
+if focus_ledger_path_status; then
+  :
+else
+  ledger_path_rc=$?
+  if [ "$ledger_path_rc" = 2 ]; then
+    printf 'focus-park: unsafe ledger path: %s\n' "$FOCUS_LEDGER" >&2
+    exit 1
+  fi
+fi
+mkdir -p "$(dirname "$FOCUS_LEDGER")" || {
+  printf 'focus-park: could not create ledger directory\n' >&2
+  exit 1
+}
 
 # One atomic O_APPEND write is the last-resort path. It may place an item at EOF,
 # but it cannot overwrite another session's item. The existing reap token gates
 # this append against guarded rename publication, closing the append/mv race.
+# Missing-ledger creation uses that same gate and one exclusive skeleton write.
 _append_park() {
-  append_guard=0
-  if focus_write_gate_acquire; then
-    append_guard=1
-  else
-    append_gate_rc=$?
-    # An unmanaged reap token also blocks cooperative renames, so direct append
-    # remains the only safe progress path in that legacy/stale state.
-    [ "$append_gate_rc" = 2 ] || return 1
-  fi
+  focus_write_gate_acquire || return 1
 
   append_rc=0
-  if [ ! -f "$FOCUS_LEDGER" ]; then
-    if ! printf '# Focus ledger\n\n%s\n\n%s\n' "$FOCUS_PARKED_HEAD" "$FOCUS_SESSION_HEAD" >> "$FOCUS_LEDGER"; then
+  append_created=0
+  if focus_ledger_path_status; then
+    :
+  else
+    append_path_rc=$?
+    case $append_path_rc in
+      1)
+        if (set -C; printf '# Focus ledger\n\n%s\n%s\n\n%s\n' \
+          "$FOCUS_PARKED_HEAD" "$item" "$FOCUS_SESSION_HEAD" > "$FOCUS_LEDGER") 2>/dev/null; then
+          append_created=1
+        elif ! focus_ledger_path_status; then
+          append_rc=1
+        fi
+        ;;
+      *) append_rc=1 ;;
+    esac
+  fi
+
+  if [ "$append_rc" = 0 ] && [ "$append_created" = 0 ]; then
+    if [ -s "$FOCUS_LEDGER" ] && [ -n "$(tail -c 1 "$FOCUS_LEDGER")" ]; then
+      if ! printf '\n' >> "$FOCUS_LEDGER"; then append_rc=1; fi
+    fi
+    if [ "$append_rc" = 0 ] && ! printf '%s\n' "$item" >> "$FOCUS_LEDGER"; then
       append_rc=1
     fi
-  elif [ -s "$FOCUS_LEDGER" ] && [ -n "$(tail -c 1 "$FOCUS_LEDGER")" ]; then
-    if ! printf '\n' >> "$FOCUS_LEDGER"; then append_rc=1; fi
   fi
-  if [ "$append_rc" = 0 ] && ! printf '%s\n' "$item" >> "$FOCUS_LEDGER"; then
-    append_rc=1
-  fi
-  [ "$append_guard" = 0 ] || focus_write_gate_release
+  focus_write_gate_release
   return "$append_rc"
 }
 
 _do_park() {
-  if [ ! -f "$FOCUS_LEDGER" ]; then
-    printf '# Focus ledger\n\n%s\n%s\n\n%s\n' \
-      "$FOCUS_PARKED_HEAD" "$item" "$FOCUS_SESSION_HEAD" > "$FOCUS_LEDGER"
-    return
+  if focus_ledger_path_status; then
+    :
+  else
+    park_path_rc=$?
+    if [ "$park_path_rc" = 1 ]; then
+      _append_park
+      return
+    fi
+    return 1
   fi
 
   # The grep gate intentionally remains a substring check. The exact shared
@@ -73,8 +99,11 @@ _do_park() {
         _append_park
         return
       fi
-      if focus_rewrite_publish; then return; fi
-      publish_rc=$?
+      if focus_rewrite_publish; then
+        return
+      else
+        publish_rc=$?
+      fi
       focus_rewrite_discard
       [ "$publish_rc" = 2 ] && continue
       _append_park
@@ -88,12 +117,18 @@ _do_park() {
 
 # Preserve the bounded 20+10 retry/reap/re-acquire mutex. Only park may use
 # the lockless append fallback; every other mutating command fails unchanged.
+park_rc=0
 if focus_lock_acquire; then
-  _do_park
+  if ! _do_park; then park_rc=1; fi
   focus_lock_release
 else
-  _append_park
+  if ! _append_park; then park_rc=1; fi
   focus_lock_release
+fi
+
+if [ "$park_rc" != 0 ]; then
+  printf 'focus-park: could not write %s\n' "$FOCUS_LEDGER" >&2
+  exit 1
 fi
 
 # Exit zero is a durability claim: require the exact inserted line to be present.

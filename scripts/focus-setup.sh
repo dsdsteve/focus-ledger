@@ -30,28 +30,53 @@ case "$scope" in
   local)  CLAUDE_MD="$PWD/CLAUDE.md" ;;
 esac
 
-mkdir -p "$(dirname "$CLAUDE_MD")"
-touch "$CLAUDE_MD"
+# Removing a genuinely absent target is a no-op. In particular, do not create
+# its parent, the target itself, or a misleading recovery backup.
+if [ "$remove" = 1 ] && [ ! -e "$CLAUDE_MD" ] && [ ! -L "$CLAUDE_MD" ]; then
+  echo "focus-ledger: pivot-park block removed from $CLAUDE_MD"
+  echo "  backup: $CLAUDE_MD.focus-bak.* · undo: focus-setup.sh $scope --remove"
+  exit 0
+fi
 
-# Refuse-before-write guard: with a mangled managed block (say, the END marker
-# hand-deleted), the strip below would set skip=1 at BEGIN and never clear it —
-# silently deleting every user line after the marker. Depth-walk the markers
-# first (same regexes the strip uses): BEGIN opens, END closes; an END with
-# nothing open, nested BEGINs, or an unclosed BEGIN at EOF refuses with rc 3
-# (bad args stay rc 2) and writes NOTHING. This sits before the backup rotation
-# so the refused path can't evict the last good backup either.
-mangled=$(awk '
-  /<!-- FOCUS-LEDGER:BEGIN/ { nb++; depth++; if (depth > 1 && !why) why="nested BEGIN markers" }
-  /FOCUS-LEDGER:END -->/    { ne++; depth--; if (depth < 0 && !why) why="END marker with no BEGIN open before it" }
-  END {
-    if (!why && depth != 0) why="BEGIN marker never closed by an END"
-    if (why) printf "%s (found %d BEGIN, %d END)", why, nb+0, ne+0
+# Scan existing bytes before mkdir, touch, backup rotation, or any rewrite.
+# Besides ordinary imbalance, reject same-line markers and multiple sequential
+# blocks because neither has one unambiguous canonical replacement range.
+if [ -e "$CLAUDE_MD" ] || [ -L "$CLAUDE_MD" ]; then
+  mangled=$(awk '
+    {
+      has_begin = index($0, "<!-- FOCUS-LEDGER:BEGIN")
+      has_end = index($0, "FOCUS-LEDGER:END -->")
+      if (has_begin && has_end) {
+        nb++; ne++
+        if (!why) why="BEGIN and END markers appear on the same line"
+        next
+      }
+      if (has_begin) {
+        nb++; depth++
+        if (depth > 1 && !why) why="nested BEGIN markers"
+      }
+      if (has_end) {
+        ne++
+        if (depth == 0) {
+          if (!why) why="END marker with no BEGIN open before it"
+        } else {
+          depth--
+          if (depth == 0) blocks++
+        }
+      }
+    }
+    END {
+      if (!why && depth != 0) why="BEGIN marker never closed by an END"
+      if (!why && blocks > 1) why="multiple managed blocks"
+      if (why) printf "%s (found %d BEGIN, %d END)", why, nb+0, ne+0
+    }
+  ' "$CLAUDE_MD") || {
+    printf 'focus-setup: marker scan failed for %s; refusing to continue.\n' "$CLAUDE_MD" >&2
+    exit 3
   }
-' "$CLAUDE_MD") || {
-  # Fail CLOSED with a clear message: an unverified file must never reach the strip.
-  printf 'focus-setup: marker scan failed for %s; refusing to continue.\n' "$CLAUDE_MD" >&2
-  exit 3
-}
+else
+  mangled=
+fi
 if [ -n "$mangled" ]; then
   {
     printf 'focus-setup: refusing to rewrite %s — FOCUS-LEDGER block is mangled: %s.\n' "$CLAUDE_MD" "$mangled"
@@ -65,28 +90,45 @@ if [ -n "$mangled" ]; then
   exit 3
 fi
 
-# Keep only the latest backup — repeated runs would otherwise pile up
-# CLAUDE.md.focus-bak.* files in the project root (easy to commit by accident).
-rm -f "$CLAUDE_MD".focus-bak.* 2>/dev/null || true
-cp "$CLAUDE_MD" "$CLAUDE_MD.focus-bak.$(date +%s)"
+strip_tmp=$(mktemp) || {
+  printf 'focus-setup: could not create rewrite staging file\n' >&2
+  exit 1
+}
+output_tmp=$(mktemp) || {
+  rm -f "$strip_tmp"
+  printf 'focus-setup: could not create output staging file\n' >&2
+  exit 1
+}
+backup_new=
+cleanup_setup() {
+  rm -f "$strip_tmp" "$output_tmp" 2>/dev/null || true
+  [ -z "$backup_new" ] || rm -f "$backup_new" 2>/dev/null || true
+}
+trap 'cleanup_setup; exit 1' INT TERM HUP
 
-# Strip any existing FOCUS-LEDGER block, then drop trailing blank lines. Buffering
-# in awk (no python, no fragile sed range) keeps the plugin's zero-extra-deps promise.
-tmp=$(mktemp)
-awk '
-  /<!-- FOCUS-LEDGER:BEGIN/ { skip=1 }
-  skip==0 { buf[n++]=$0 }
-  /FOCUS-LEDGER:END -->/ { skip=0 }
-  END {
-    last=-1
-    for (i=0; i<n; i++) if (buf[i] ~ /[^[:space:]]/) last=i
-    for (i=0; i<=last; i++) print buf[i]
-  }
-' "$CLAUDE_MD" > "$tmp"
+# Strip the one validated managed block, then drop trailing blank lines.
+if [ -e "$CLAUDE_MD" ] || [ -L "$CLAUDE_MD" ]; then
+  if ! awk '
+    /<!-- FOCUS-LEDGER:BEGIN/ { skip=1 }
+    skip==0 { buf[n++]=$0 }
+    /FOCUS-LEDGER:END -->/ { skip=0 }
+    END {
+      last=-1
+      for (i=0; i<n; i++) if (buf[i] ~ /[^[:space:]]/) last=i
+      for (i=0; i<=last; i++) print buf[i]
+    }
+  ' "$CLAUDE_MD" > "$strip_tmp"; then
+    cleanup_setup
+    printf 'focus-setup: could not prepare rewrite for %s\n' "$CLAUDE_MD" >&2
+    exit 1
+  fi
+else
+  : > "$strip_tmp"
+fi
 
-# Rewrite: kept content, then (unless removing) a blank separator + the fresh block.
+# Build the complete canonical output before touching the target or its backups.
 {
-  if [ -s "$tmp" ]; then cat "$tmp"; [ "$remove" = 1 ] || printf '\n'; fi
+  if [ -s "$strip_tmp" ]; then cat "$strip_tmp"; [ "$remove" = 1 ] || printf '\n'; fi
   if [ "$remove" = 0 ]; then
     cat <<'BLOCK'
 <!-- FOCUS-LEDGER:BEGIN — offer to park on pivot. Update or remove: /focus-ledger:setup -->
@@ -99,8 +141,48 @@ something unfinished — not every topic change.
 <!-- FOCUS-LEDGER:END -->
 BLOCK
   fi
-} > "$CLAUDE_MD"
-rm -f "$tmp"
+} > "$output_tmp"
+
+mkdir -p "$(dirname "$CLAUDE_MD")" || {
+  cleanup_setup
+  printf 'focus-setup: could not create target directory for %s\n' "$CLAUDE_MD" >&2
+  exit 1
+}
+
+# Publish and verify a new recovery copy before deleting any older generation.
+# A failed or partial copy leaves both the target and every prior backup intact.
+if [ -e "$CLAUDE_MD" ] || [ -L "$CLAUDE_MD" ]; then
+  backup_new=$(mktemp "$CLAUDE_MD.focus-bak.XXXXXXXX") || {
+    cleanup_setup
+    printf 'focus-setup: could not create recovery backup for %s\n' "$CLAUDE_MD" >&2
+    exit 1
+  }
+  if ! cp "$CLAUDE_MD" "$backup_new" || ! cmp -s "$CLAUDE_MD" "$backup_new"; then
+    cleanup_setup
+    printf 'focus-setup: could not verify recovery backup for %s\n' "$CLAUDE_MD" >&2
+    exit 1
+  fi
+  for old_backup in "$CLAUDE_MD".focus-bak.*; do
+    [ -e "$old_backup" ] || [ -L "$old_backup" ] || continue
+    [ "$old_backup" = "$backup_new" ] || rm -f "$old_backup" || {
+      cleanup_setup
+      printf 'focus-setup: could not replace prior recovery backup for %s\n' "$CLAUDE_MD" >&2
+      exit 1
+    }
+  done
+  # From this point the verified new generation is the recovery backup, even if
+  # the later target write fails.
+  backup_new=
+fi
+
+if ! cat "$output_tmp" > "$CLAUDE_MD"; then
+  cleanup_setup
+  printf 'focus-setup: could not rewrite %s\n' "$CLAUDE_MD" >&2
+  exit 1
+fi
+backup_new=
+cleanup_setup
+trap - INT TERM HUP
 
 if [ "$remove" = 1 ]; then
   echo "focus-ledger: pivot-park block removed from $CLAUDE_MD"
