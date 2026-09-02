@@ -32,7 +32,25 @@ jobs:
             sudo apt-get install -y dash
           fi
       - name: run suite under bash
-        run: bash test/run.sh bash
+        shell: bash
+        run: |
+          set +e
+          bash test/run.sh bash 2>&1 | tee /tmp/focus-ledger-bash.log
+          rc=${PIPESTATUS[0]}
+          set -e
+          if [[ $rc -ne 0 ]]; then
+            grep 'FAIL' /tmp/focus-ledger-bash.log | sed 's/^/::error::/' || true
+          fi
+          exit "$rc"
       - name: run suite under dash
         if: ${{ always() }}
-        run: bash test/run.sh dash
+        shell: bash
+        run: |
+          set +e
+          bash test/run.sh dash 2>&1 | tee /tmp/focus-ledger-dash.log
+          rc=${PIPESTATUS[0]}
+          set -e
+          if [[ $rc -ne 0 ]]; then
+            grep 'FAIL' /tmp/focus-ledger-dash.log | sed 's/^/::error::/' || true
+          fi
+          exit "$rc"
