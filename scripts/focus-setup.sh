@@ -41,8 +41,9 @@ fi
 # Scan existing bytes before mkdir, touch, backup rotation, or any rewrite.
 # Besides ordinary imbalance, reject same-line markers and multiple sequential
 # blocks because neither has one unambiguous canonical replacement range.
+managed_blocks=0
 if [ -e "$CLAUDE_MD" ] || [ -L "$CLAUDE_MD" ]; then
-  mangled=$(awk '
+  scan_result=$(awk '
     {
       has_begin = index($0, "<!-- FOCUS-LEDGER:BEGIN")
       has_end = index($0, "FOCUS-LEDGER:END -->")
@@ -68,12 +69,25 @@ if [ -e "$CLAUDE_MD" ] || [ -L "$CLAUDE_MD" ]; then
     END {
       if (!why && depth != 0) why="BEGIN marker never closed by an END"
       if (!why && blocks > 1) why="multiple managed blocks"
-      if (why) printf "%s (found %d BEGIN, %d END)", why, nb+0, ne+0
+      if (why) {
+        printf "error:%s (found %d BEGIN, %d END)", why, nb+0, ne+0
+      } else {
+        printf "blocks:%d", blocks+0
+      }
     }
   ' "$CLAUDE_MD") || {
     printf 'focus-setup: marker scan failed for %s; refusing to continue.\n' "$CLAUDE_MD" >&2
     exit 3
   }
+  case $scan_result in
+    blocks:0) managed_blocks=0; mangled= ;;
+    blocks:1) managed_blocks=1; mangled= ;;
+    error:*) mangled=${scan_result#error:} ;;
+    *)
+      printf 'focus-setup: marker scan failed for %s; refusing to continue.\n' "$CLAUDE_MD" >&2
+      exit 3
+      ;;
+  esac
 else
   mangled=
 fi
@@ -88,6 +102,14 @@ if [ -n "$mangled" ]; then
     fi
   } >&2
   exit 3
+fi
+
+# Removing from an existing marker-free file is also a strict no-op. Preserve
+# every byte, metadata field, and prior recovery generation.
+if [ "$remove" = 1 ] && [ "$managed_blocks" = 0 ]; then
+  echo "focus-ledger: pivot-park block removed from $CLAUDE_MD"
+  echo "  backup: $CLAUDE_MD.focus-bak.* · undo: focus-setup.sh $scope --remove"
+  exit 0
 fi
 
 strip_tmp=$(mktemp) || {

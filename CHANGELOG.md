@@ -4,6 +4,15 @@ All notable changes to focus-ledger are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/); this project uses
 [semantic versioning](https://semver.org/).
 
+## [1.2.1] — 2026-08-25
+
+### Fixed
+- Setup removal against an existing marker-free `CLAUDE.md` is now a true
+  no-op: target bytes and metadata plus existing recovery backups remain
+  unchanged.
+- Tidy archive-stage read failures now return through owned cleanup instead of
+  exiting around lock release and transient-backup removal.
+
 ## [1.2.0] — 2026-08-25
 
 ### Added

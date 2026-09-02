@@ -2,7 +2,7 @@
 
 A cross-session task ledger for Claude Code, with soft nudges. Park open threads that survive restarts, have them replayed when you open a session, and get a quiet flag when one goes stale. The tool holds the state so you don't have to remember to.
 
-**Current release:** `1.2.0`. In 1.2.0 the optional pre-write nudge became opt-in: `FOCUS_WRITE_CHECK` must be `on` or `strict`; unset, `off`, and other values are silent.
+**Current release:** `1.2.1`. This patch makes marker-free setup removal a true no-op and ensures tidy archive-stage read failures release owned locks and temporary recovery files. In 1.2.0 the optional pre-write nudge became opt-in: `FOCUS_WRITE_CHECK` must be `on` or `strict`; unset, `off`, and other values are silent.
 
 ## What it does
 
@@ -57,7 +57,7 @@ For deterministic listing, matching, completion, and cleanup:
 - `focus`, matching, Stop, and tidy skip malformed or near-miss records rather than guessing. `doctor` reports the exact line and hand-fix without changing it. Tidy also reports malformed lines as `SKIP` and leaves them byte-for-byte unchanged.
 - SessionStart retains a legacy, more permissive replay rule for column-one open lines under a heading beginning `## Parked`; run `doctor` if SessionStart shows something that `focus` omits.
 
-This is **format v1**. Release 1.2.0 does not change it.
+This is **format v1**. Release 1.2.1 does not change it.
 
 ### Ranking and selection
 
@@ -140,7 +140,7 @@ Some people want the assistant to offer to park an unfinished thread after a rea
 
 Before creating a parent, target, backup, or staging rewrite, setup validates the existing `<!-- FOCUS-LEDGER:BEGIN ... -->` / `<!-- FOCUS-LEDGER:END -->` structure. Unmatched, nested, unclosed, same-line, or multiple balanced blocks refuse with status 3; target existence, bytes, mtime, and existing backups remain unchanged. Recover by restoring the newest `CLAUDE.md.focus-bak.*` if one exists, or hand-delete only the partial managed block, then rerun.
 
-On an accepted install, update, or removal of an existing target, setup first creates and byte-verifies a new `<CLAUDE.md>.focus-bak.<epoch>.<suffix>` recovery copy, then rotates older matching generations and rewrites the target. A missing `--remove` target is a true no-op, and a first install has no source file to back up. Re-running updates the one managed block; removal takes it out. The installed instruction offers to park; it never auto-parks.
+On an accepted install, update, or removal of an actually present managed block, setup first creates and byte-verifies a new `<CLAUDE.md>.focus-bak.<epoch>.<suffix>` recovery copy, then rotates older matching generations and rewrites the target. A `--remove` against either a missing target or an existing marker-free target is a true no-op: it preserves target bytes and metadata and every existing backup. A first install has no source file to back up. Re-running updates the one managed block; removal takes it out. The installed instruction offers to park; it never auto-parks.
 
 ## Exit status and retry notes
 

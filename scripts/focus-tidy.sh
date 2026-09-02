@@ -932,17 +932,18 @@ if [ "$archive_count" -gt 0 ]; then
     fail_locked 'archive candidate count changed during staging'
   archive_stage=$(mktemp "$ARCHIVE.tmp.XXXXXX" 2>/dev/null) ||
     fail_locked 'could not create same-directory archive stage'
-  {
+  (
     if [ "$archive_existed" = 1 ] && [ -s "$archive_backup" ]; then
       cat "$archive_backup" || exit 1
-      if [ -n "$(tail -c 1 "$archive_backup")" ]; then printf '\n'; fi
+      archive_last_byte=$(tail -c 1 "$archive_backup") || exit 1
+      if [ -n "$archive_last_byte" ]; then printf '\n'; fi
       printf '\n'
     else
       printf '# Focus ledger archive\n\n'
     fi
     printf '## Archived by focus-ledger tidy on %s (epoch %s)\n\n' "$calendar_today" "$now_epoch"
     cat "$archive_lines"
-  } > "$archive_stage" || fail_locked 'could not stage archive'
+  ) > "$archive_stage" || fail_locked 'could not stage archive'
   archive_expected=$(mktemp "$ARCHIVE.verify.XXXXXX" 2>/dev/null) ||
     fail_locked 'could not create archive verification snapshot'
   cat "$archive_stage" > "$archive_expected" || fail_locked 'could not snapshot expected archive'

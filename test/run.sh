@@ -796,6 +796,35 @@ two
   report_case "$sh_bin" "setup: missing --remove target creates nothing" "$setup_ok" "$setup_why"
   rm -rf "$mhome"
 
+  # Removing from an existing marker-free target is also a strict no-op: no
+  # byte, mode, mtime, or recovery-generation churn.
+  nhome=$(mktemp -d); nmd="$nhome/CLAUDE.md"
+  printf '# Marker-free rules\n\nkeep these bytes\n\n \n' > "$nmd"
+  chmod 640 "$nmd"; touch -t 200001010000 "$nmd"
+  nbackup="$nmd.focus-bak.946684800.ABC123"
+  printf 'prior recovery bytes\n' > "$nbackup"
+  chmod 600 "$nbackup"; touch -t 200001020000 "$nbackup"
+  nsum=$(cksum < "$nmd"); nmode=$(test_mode_octal "$nmd"); nmtime=$(test_mtime_epoch "$nmd")
+  nbackup_sum=$(cksum < "$nbackup"); nbackup_mode=$(test_mode_octal "$nbackup")
+  nbackup_mtime=$(test_mtime_epoch "$nbackup")
+  ( cd "$nhome" && env -i HOME="$nhome" PATH="$PATH" "$sh_bin" \
+    "$ROOT/scripts/focus-setup.sh" local --remove > "$nhome/out" 2> "$nhome/err" ); nrc=$?
+  set -- "$nmd".focus-bak.*
+  setup_ok=1; setup_why=""
+  [ "$nrc" = 0 ] && [ ! -s "$nhome/err" ] &&
+    [ "$(cksum < "$nmd")" = "$nsum" ] &&
+    [ "$(test_mode_octal "$nmd")" = "$nmode" ] &&
+    [ "$(test_mtime_epoch "$nmd")" = "$nmtime" ] &&
+    [ "$#" = 1 ] && [ "$1" = "$nbackup" ] &&
+    [ "$(cksum < "$nbackup")" = "$nbackup_sum" ] &&
+    [ "$(test_mode_octal "$nbackup")" = "$nbackup_mode" ] &&
+    [ "$(test_mtime_epoch "$nbackup")" = "$nbackup_mtime" ] || {
+      setup_ok=0; setup_why="rc=$nrc or marker-free target/backup bytes or metadata changed"
+    }
+  report_case "$sh_bin" "setup: marker-free --remove preserves target and prior backup exactly" \
+    "$setup_ok" "$setup_why"
+  rm -rf "$nhome"
+
   # Pin every byte of the canonical installed block.
   chome=$(mktemp -d); cmd="$chome/CLAUDE.md"
   printf '# My rules\n\nkeep this line.\n' > "$cmd"
@@ -1787,6 +1816,21 @@ test_mtime_epoch() {
   if test_mtime_value=$(stat -c '%Y' "$test_mtime_path" 2>/dev/null) &&
      case $test_mtime_value in ''|*[!0-9]*) false ;; *) true ;; esac; then
     printf '%s\n' "$test_mtime_value"
+    return
+  fi
+  printf 'unavailable\n'
+}
+
+test_mode_octal() {
+  test_mode_path=$1
+  if test_mode_value=$(stat -f '%Lp' "$test_mode_path" 2>/dev/null) &&
+     case $test_mode_value in ''|*[!0-7]*) false ;; *) true ;; esac; then
+    printf '%s\n' "$test_mode_value"
+    return
+  fi
+  if test_mode_value=$(stat -c '%a' "$test_mode_path" 2>/dev/null) &&
+     case $test_mode_value in ''|*[!0-7]*) false ;; *) true ;; esac; then
+    printf '%s\n' "$test_mode_value"
     return
   fi
   printf 'unavailable\n'
@@ -2788,6 +2832,95 @@ run_tidy_review_patch_checks() {
   report_case "$sh_bin" "tidy patch: rollback-after-publish seam restores without corruption" "$patch_ok" "$patch_why"
   rm -f "$patch_archive" "$patch_ledger".backup.*
 
+  # An archive-backup read failure during staging must return through
+  # fail_locked so every owned lock, backup, and work file is removed.
+  cp "$FIX/tidy-mixed.md" "$patch_ledger"; cp "$patch_ledger" "$patch_home/stage-read.before"
+  printf '# stage-read archive\nkeep\n' > "$patch_archive"
+  cp "$patch_archive" "$patch_home/stage-read-archive.before"
+  stage_cat_stub=$(mktemp -d)
+  cat > "$stage_cat_stub/cat" <<'TIDY_STAGE_CAT'
+#!/bin/sh
+case ${1:-} in
+  "$FOCUS_FAIL_ARCHIVE".backup.*)
+    if [ ! -e "$FOCUS_FAIL_ONCE" ]; then
+      : > "$FOCUS_FAIL_ONCE"
+      exit 1
+    fi
+    ;;
+esac
+exec "$FOCUS_REAL_CAT" "$@"
+TIDY_STAGE_CAT
+  chmod +x "$stage_cat_stub/cat"
+  env -i HOME="$patch_home" PATH="$stage_cat_stub:$patch_path" \
+    FOCUS_REAL_CAT="$(command -v cat)" FOCUS_FAIL_ARCHIVE="$patch_archive" \
+    FOCUS_FAIL_ONCE="$patch_home/stage-cat.once" \
+    "$sh_bin" "$ROOT/scripts/focus-tidy.sh" --apply > "$patch_home/stage-read.out" \
+    2> "$patch_home/stage-read.err"; stage_read_rc=$?
+  stage_artifacts=0
+  for stage_path in "$patch_ledger".backup.* "$patch_ledger".tmp.* \
+    "$patch_ledger".verify* "$patch_ledger".archive-lines.* \
+    "$patch_archive".backup.* "$patch_archive".tmp.* "$patch_archive".verify*; do
+    [ ! -e "$stage_path" ] && [ ! -L "$stage_path" ] || stage_artifacts=1
+  done
+  patch_ok=1; patch_why=""
+  [ "$stage_read_rc" = 2 ] && [ -e "$patch_home/stage-cat.once" ] &&
+    [ ! -s "$patch_home/stage-read.out" ] &&
+    grep -qF 'could not stage archive' "$patch_home/stage-read.err" &&
+    cmp -s "$patch_ledger" "$patch_home/stage-read.before" &&
+    cmp -s "$patch_archive" "$patch_home/stage-read-archive.before" &&
+    [ ! -e "$patch_ledger.lock" ] && [ ! -e "$patch_ledger.lock.reap" ] &&
+    [ ! -e "$patch_archive.lock" ] && [ "$stage_artifacts" = 0 ] || {
+      patch_ok=0; patch_why="archive-stage read failure bypassed cleanup (rc=$stage_read_rc artifacts=$stage_artifacts)"
+    }
+  report_case "$sh_bin" "tidy patch: archive-stage read failure releases owned state" \
+    "$patch_ok" "$patch_why"
+  rm -rf "$stage_cat_stub"; rm -f "$patch_home/stage-cat.once" "$patch_archive" "$patch_ledger".backup.*
+
+  # The final-byte probe is an independent archive-backup read and must take
+  # the same cleanup path when it fails.
+  cp "$FIX/tidy-mixed.md" "$patch_ledger"; cp "$patch_ledger" "$patch_home/stage-tail.before"
+  printf '# stage-tail archive\nkeep\n' > "$patch_archive"
+  cp "$patch_archive" "$patch_home/stage-tail-archive.before"
+  stage_tail_stub=$(mktemp -d)
+  cat > "$stage_tail_stub/tail" <<'TIDY_STAGE_TAIL'
+#!/bin/sh
+for tail_last do :; done
+case $tail_last in
+  "$FOCUS_FAIL_ARCHIVE".backup.*)
+    if [ ! -e "$FOCUS_FAIL_ONCE" ]; then
+      : > "$FOCUS_FAIL_ONCE"
+      exit 1
+    fi
+    ;;
+esac
+exec "$FOCUS_REAL_TAIL" "$@"
+TIDY_STAGE_TAIL
+  chmod +x "$stage_tail_stub/tail"
+  env -i HOME="$patch_home" PATH="$stage_tail_stub:$patch_path" \
+    FOCUS_REAL_TAIL="$(command -v tail)" FOCUS_FAIL_ARCHIVE="$patch_archive" \
+    FOCUS_FAIL_ONCE="$patch_home/stage-tail.once" \
+    "$sh_bin" "$ROOT/scripts/focus-tidy.sh" --apply > "$patch_home/stage-tail.out" \
+    2> "$patch_home/stage-tail.err"; stage_tail_rc=$?
+  stage_tail_artifacts=0
+  for stage_path in "$patch_ledger".backup.* "$patch_ledger".tmp.* \
+    "$patch_ledger".verify* "$patch_ledger".archive-lines.* \
+    "$patch_archive".backup.* "$patch_archive".tmp.* "$patch_archive".verify*; do
+    [ ! -e "$stage_path" ] && [ ! -L "$stage_path" ] || stage_tail_artifacts=1
+  done
+  patch_ok=1; patch_why=""
+  [ "$stage_tail_rc" = 2 ] && [ -e "$patch_home/stage-tail.once" ] &&
+    [ ! -s "$patch_home/stage-tail.out" ] &&
+    grep -qF 'could not stage archive' "$patch_home/stage-tail.err" &&
+    cmp -s "$patch_ledger" "$patch_home/stage-tail.before" &&
+    cmp -s "$patch_archive" "$patch_home/stage-tail-archive.before" &&
+    [ ! -e "$patch_ledger.lock" ] && [ ! -e "$patch_ledger.lock.reap" ] &&
+    [ ! -e "$patch_archive.lock" ] && [ "$stage_tail_artifacts" = 0 ] || {
+      patch_ok=0; patch_why="archive-stage tail failure bypassed cleanup (rc=$stage_tail_rc artifacts=$stage_tail_artifacts)"
+    }
+  report_case "$sh_bin" "tidy patch: archive final-byte failure releases owned state" \
+    "$patch_ok" "$patch_why"
+  rm -rf "$stage_tail_stub"; rm -f "$patch_home/stage-tail.once" "$patch_archive" "$patch_ledger".backup.*
+
   # A non-cooperative ledger edit after archive publication fails before ledger
   # rename and is never overwritten by rollback.
   cp "$FIX/tidy-mixed.md" "$patch_ledger"; cp "$patch_ledger" "$patch_home/conflict.before"
@@ -3359,10 +3492,10 @@ EOF_README_COMMANDS
     "$ROOT/README.md" | sed -n '1p')
   static_version_ok=1
   static_version_why=""
-  if [ "$static_plugin_version" != 1.2.0 ] ||
-     [ "$static_marketplace_version" != 1.2.0 ] ||
-     [ "$static_changelog_version" != 1.2.0 ] ||
-     [ "$static_readme_version" != 1.2.0 ]; then
+  if [ "$static_plugin_version" != 1.2.1 ] ||
+     [ "$static_marketplace_version" != 1.2.1 ] ||
+     [ "$static_changelog_version" != 1.2.1 ] ||
+     [ "$static_readme_version" != 1.2.1 ]; then
     static_version_ok=0
     static_version_why="plugin=$static_plugin_version marketplace=$static_marketplace_version changelog=$static_changelog_version README=$static_readme_version"
   elif ! grep -qi 'opt-in' "$ROOT/README.md" ||
@@ -3374,7 +3507,7 @@ EOF_README_COMMANDS
     static_version_ok=0
     static_version_why="Epic 1 cherry-pickable 1.1.2 patch note missing from CHANGELOG"
   fi
-  report_case static "release: metadata, README, and CHANGELOG agree on 1.2.0" \
+  report_case static "release: metadata, README, and CHANGELOG agree on 1.2.1" \
     "$static_version_ok" "$static_version_why"
 
   static_exec_ok=1
@@ -3404,12 +3537,12 @@ with open(sys.argv[3], encoding="utf-8") as stream:
     manifest = json.load(stream)
 
 assert plugin["name"] == "focus-ledger"
-assert plugin["version"] == "1.2.0"
+assert plugin["version"] == "1.2.1"
 assert marketplace["name"] == "focus-ledger"
 assert len(marketplace["plugins"]) == 1
 assert marketplace["plugins"][0]["name"] == "focus-ledger"
 assert marketplace["plugins"][0]["source"] == "./"
-assert marketplace["plugins"][0]["version"] == "1.2.0"
+assert marketplace["plugins"][0]["version"] == "1.2.1"
 
 expected = {
     "SessionStart": ("startup|resume|clear|compact", "${CLAUDE_PLUGIN_ROOT}/hooks/focus-session-start.sh", 5),
