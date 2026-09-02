@@ -73,15 +73,19 @@ A numeric query selects the current displayed rank (`resume` accepts only a rank
 
 ### Tidy is report → confirm → apply
 
-`/focus-ledger:tidy` always runs read-only report mode first and relays every `META`, action, `SKIP`, `BLOCK`, and `SUMMARY` row. Report mode creates no lock or temporary file and changes no mtime. Apply is offered only when the report contains an automatic action and no `BLOCK`; the command runs `--apply` only after an answer that is exactly `yes`, case-insensitively, with no qualification.
+`/focus-ledger:tidy` always runs read-only report mode first and relays every `META`, action, `SKIP`, `BLOCK`, and final `SUMMARY` row. If capture is truncated/incomplete or the final `SUMMARY` is missing, it stops. Report mode creates no lock or temporary file and changes no mtime. Apply is offered only when the complete report contains an automatic action and no `BLOCK`; the command runs `--apply` only after an answer whose entire content is the standalone word `yes`, case-insensitively.
 
-Apply does not trust the earlier report as a transaction plan. It locks the current ledger, re-derives candidates, stages same-filesystem replacements, verifies exact open/near-miss/retained-record multisets, and then reports the fresh result. It:
+Apply does not trust the earlier report as a transaction plan. It locks the current ledger, re-derives candidates (including newly arrived actions), stages same-filesystem replacements, verifies exact duplicate-aware open/near-miss/retained-record multisets, and explicitly proves every promoted or re-homed occurrence is inside Parked before the first following real H2. It:
 
 - **archives, never discards, eligible completed records** into `~/.claude/focus-ledger-archive.md`;
 - promotes valid open This session records to Parked;
 - re-homes valid open records found outside the required sections;
-- removes only expired numeric snooze/cooldown markers and safely classified stale rewrite temps;
+- removes only expired numeric snooze/cooldown markers and safely classified stale PID-bearing rewrite temps;
 - never guesses a section for a completed record outside the required sections and never repairs malformed text.
+
+Missing and empty ledgers are intentional report/apply no-ops: tidy creates no lock or backup and does **not** clean markers or temps in that state. Inspect those exact artifacts manually. A cleanup-only apply against a nonempty ledger does not create a ledger backup and leaves ledger bytes and mtime unchanged.
+
+Quarantine renames are the volatile-deletion commit. Later unlink or owned lock/work-file cleanup failures do not attempt an impossible rollback; tidy returns nonzero with `APPLY verified-with-artifacts` and prints each retained recovery path. Core publication or pre-commit failures still attempt rollback, defer a second `INT`/`TERM`/`HUP` until restoration and lock release complete, and preserve/name surviving backups or quarantine copies when recovery is incomplete.
 
 Invoking `scripts/focus-tidy.sh --apply` directly bypasses the command prompt's confirmation gate.
 
@@ -97,6 +101,13 @@ Or test locally without installing:
 ```bash
 claude --plugin-dir ./focus-ledger
 ```
+
+## Uninstall and optional data removal
+
+1. Remove any optional pivot instruction you installed: run `/focus-ledger:setup local remove` in each project and/or `/focus-ledger:setup global remove`. This changes only the managed `CLAUDE.md` block; bare “uninstall” is not treated as setup removal.
+2. In Claude Code, open `/plugin`, select the installed `focus-ledger@focus-ledger` entry, and uninstall/disable it through the plugin manager. If you used `--plugin-dir`, stop launching Claude with that directory instead.
+3. Plugin removal deliberately leaves user data and recovery material. To erase it, first stop all Claude/focus-ledger processes. Inspect and, only if no recovery is needed, remove these exact regular paths: `~/.claude/focus-ledger.md`, `~/.claude/focus-ledger-archive.md`, `~/.claude/.focus-snooze`, `~/.claude/.focus-last-nudge`, selected `~/.claude/focus-ledger.md.backup.*` generations, and selected local/global `<CLAUDE.md>.focus-bak.*` generations.
+4. Run `doctor` before uninstall if possible. Manually inspect any reported abandoned `.lock`, `.lock.reap`, `.claim.<pid>`, `.tmp.*`, `.verify*`, `.rollback.*`, `.tidy-delete.<pid>`, `.restore`, or archive transaction artifacts; remove only exact paths after confirming no recorded process is alive. Avoid broad globs around active state.
 
 ## Tuning
 
@@ -115,6 +126,8 @@ Only those five names are supported user configuration. For auditability, runtim
 
 `FOCUS_ARCHIVE_PATH`, `FOCUS_CALENDAR_DATE`, `FOCUS_DISPLAY_LEDGER`, `FOCUS_LEDGER`, `FOCUS_LEDGER_PATH`, `FOCUS_LIB_DIR`, `FOCUS_LOCK`, `FOCUS_LOCKED`, `FOCUS_LOCK_TOKEN`, `FOCUS_MARKER_PATH`, `FOCUS_MATCH_ELIGIBLE`, `FOCUS_MATCH_QUERY`, `FOCUS_PARKED_HEAD`, `FOCUS_PARSE_AWK`, `FOCUS_PARSE_MODE`, `FOCUS_PRE_BYTES`, `FOCUS_PRE_CKSUM`, `FOCUS_PRE_FINAL_NEWLINE`, `FOCUS_PRE_LINES`, `FOCUS_REAP`, `FOCUS_REAPING`, `FOCUS_REAP_TOKEN`, `FOCUS_REWRITE_ITEM`, `FOCUS_SESSION_HEAD`, `FOCUS_STALE_THRESHOLD`, `FOCUS_TARGET_LINE`, `FOCUS_TMP`, `FOCUS_TODAY_DAYS`, `FOCUS_TRIM`, and `FOCUS_WRITE_GATE`.
 
+`FOCUS_TIDY_TEST_FAIL` is an implementation-only test fault selector used by the automated suite to enter rollback/recovery phases deterministically. It is unsupported, is not a user setting, and must never be set during normal command use.
+
 ## Optional: offer to park when you change direction
 
 Some people want the assistant to offer to park an unfinished thread after a real pivot. That judgment cannot be a shell hook, so `setup` installs a managed instruction in `CLAUDE.md`. It is off by default because it affects future conversations.
@@ -125,9 +138,9 @@ Some people want the assistant to offer to park an unfinished thread after a rea
 /focus-ledger:setup remove    # local unless another scope is stated
 ```
 
-Before rotating a backup or rewriting content, setup validates the `<!-- FOCUS-LEDGER:BEGIN ... -->` / `<!-- FOCUS-LEDGER:END -->` structure. Unmatched, nested, or unclosed markers refuse with status 3; content and existing backups remain unchanged. The script may create the parent/target or update an existing target's mtime before that scan, so status 3 is a content-safety guarantee, not a zero-filesystem-effects guarantee. Recover by restoring the newest `CLAUDE.md.focus-bak.*` if one exists, or hand-delete only the partial managed block, then rerun.
+Before creating a parent, target, backup, or staging rewrite, setup validates the existing `<!-- FOCUS-LEDGER:BEGIN ... -->` / `<!-- FOCUS-LEDGER:END -->` structure. Unmatched, nested, unclosed, same-line, or multiple balanced blocks refuse with status 3; target existence, bytes, mtime, and existing backups remain unchanged. Recover by restoring the newest `CLAUDE.md.focus-bak.*` if one exists, or hand-delete only the partial managed block, then rerun.
 
-On an accepted install, update, or removal, setup removes older matching backups, copies the current file to `CLAUDE.md.focus-bak.<epoch>`, and rewrites the target. Re-running updates the one managed block; removal takes it out. The installed instruction offers to park; it never auto-parks.
+On an accepted install, update, or removal of an existing target, setup first creates and byte-verifies a new `<CLAUDE.md>.focus-bak.<epoch>.<suffix>` recovery copy, then rotates older matching generations and rewrites the target. A missing `--remove` target is a true no-op, and a first install has no source file to back up. Re-running updates the one managed block; removal takes it out. The installed instruction offers to park; it never auto-parks.
 
 ## Exit status and retry notes
 
@@ -135,9 +148,9 @@ On an accepted install, update, or removal, setup removes older matching backups
 - `focus-list.sh` returns 0 with TSV or empty output when the ledger is absent/empty; parser or local-date failure returns nonzero and must not be presented as an empty ledger.
 - `focus-snooze.sh` returns 2 for an invalid, zero, overflowing, or unformattable duration; operational clock/directory/lock/write failure returns 1; status 0 means the marker was published and a confirmation was printed.
 - Park's final exact-line check cannot distinguish a line written by this attempt from an identical line already present. A crash after publication but before confirmation, followed by a retry, can create a duplicate; inspect with `focus` or `doctor` before retrying an uncertain identical park.
-- `resume` and `done` return 1 for no eligible match, 3 for ambiguity, and 4 when locking or guarded publication cannot be proven; those paths intend to leave the ledger unchanged.
+- `resume` and `done` return 2 for an empty normalized query, 1 for no eligible match, 3 for ambiguity, and 4 when locking or guarded publication cannot be proven; those paths leave the ledger unchanged.
 - `setup` returns 3 for marker-scan failure or malformed marker structure and prints recovery guidance. Unknown arguments return 2.
-- `doctor` returns 0 for clean or not-yet-created state, 1 when findings were fully reported, and 2 when diagnosis was incomplete. `tidy` uses 0 for a report/verified apply/no-op and 2 for refusal or operational failure.
+- `doctor` returns 0 for clean or not-yet-created state, 1 when findings were fully reported, and 2 when diagnosis was incomplete. `tidy` uses 0 for a complete report/verified apply/no-op and 2 for refusal, operational failure, incomplete rollback, or a verified apply that retained named cleanup artifacts.
 
 A successful read-after-write check is not an `fsync` or stable-storage guarantee; see the recovery limits below.
 
@@ -160,40 +173,40 @@ There are no network calls. Trust is local filesystem access plus what plugin ou
 | `~/.claude/.focus-last-nudge` | Stop; expired marker cleanup by tidy | Retained cooldown state. |
 | `~/.claude/focus-ledger.md.backup.YYYYMMDDTHHMMSS.XXXXXX` | tidy apply | Verified recovery copy intentionally retained after successful apply; later applies may accumulate copies. |
 | `./CLAUDE.md` or `~/.claude/CLAUDE.md` | explicit setup/update/remove | Retained managed instruction target. |
-| `<CLAUDE.md>.focus-bak.<epoch>` | setup | Retained recovery copy; setup rotates older matching copies before an accepted rewrite. |
+| `<CLAUDE.md>.focus-bak.<epoch>.<suffix>` | setup | Retained recovery copy; setup verifies the new generation before rotating older matching copies. |
 
 Tidy and doctor never purge the retained archive or successful tidy ledger backups. Completed text can therefore remain indefinitely after it leaves the active ledger. To purge it, first ensure no focus-ledger command is running, inspect and preserve any recovery copy you still need, then remove only the exact regular archive/backup files you selected with ordinary filesystem tools. Avoid broad globs around active locks or transaction files. Setup backups are different: an accepted setup run automatically keeps only its newest matching generation.
 
 ### Locks, stages, and recovery transients
 
-- Ledger, snooze, and last-nudge operations can create `<target>.lock/owner` and `<target>.lock.reap/owner`. Tidy creates the archive lock `focus-ledger-archive.md.lock/owner` and also takes marker locks during cleanup.
+- Ledger, snooze, last-nudge, and archive locking can create `<target>.lock/owner`, `<target>.lock.reap/owner`, and pre-publication claim siblings such as `<target>.lock.claim.<pid>` or `<target>.lock.reap.claim.<pid>`. Tidy also takes marker locks during cleanup.
 - Ledger rewrites create `focus-ledger.md.tmp.<pid>.XXXXXX` and sometimes a `.trim` companion. Marker publication creates `<marker>.tmp.<pid>`.
 - Tidy creates ledger/archive stages and verification files such as `.tmp.*`, `.verify*`, `.archive-lines.*`, and a transient archive transaction backup. Rollback can create `<target>.rollback.*`.
-- Before deleting an expired marker or eligible stale temp, tidy renames it to `<original>.tidy-delete.<pid>` and creates a `.restore` recovery copy. It removes those only after core publication verifies.
-- Setup uses an implementation-selected system temporary file while rewriting `CLAUDE.md`.
+- Before deleting an expired marker or eligible stale temp, tidy renames it to `<original>.tidy-delete.<pid>` and creates a `.restore` recovery copy. The quarantine rename commits logical deletion; unlink failures can intentionally retain a named recovery artifact.
+- Setup uses two implementation-selected system temporary files while building the stripped and canonical `CLAUDE.md` output.
 
-These are normally removed on handled success or failure. A crash, `SIGKILL`, shell abort, or power loss can retain locks, stages, transaction backups, quarantine files, or setup temps. `doctor` reports the ledger lock/reap directories, snooze and last-nudge marker state, managed-block files, and `focus-ledger.md.*` adjacent artifacts. It does not inventory archive-adjacent files, marker lock/temp/quarantine paths, or implementation-selected setup temps. Tidy removes only its narrowly classified safe stale ledger-rewrite temps and expired regular markers. Unknown files require manual review.
+These are normally removed on handled success or failure. A crash, `SIGKILL`, shell abort, or power loss can retain locks, claims, stages, transaction backups, quarantine files, or setup temps. `doctor` reports ledger, archive, snooze, and cooldown lock/reap directories and pending claims; snooze/cooldown marker state; managed-block files; narrowly classified ledger-adjacent artifacts; and common archive-adjacent transaction leftovers. It deliberately excludes successful retained tidy ledger backups and does not inventory arbitrary paths or implementation-selected setup temps. Tidy removes only its narrowly classified safe stale PID-bearing ledger-rewrite temps and expired regular markers. Legacy/manual adjacent files and unknown recovery artifacts require manual review.
 
 ### Unsafe path handling is intentionally narrow
 
-- `doctor` refuses to follow a ledger or `CLAUDE.md` symlink and reports unsafe/nonregular ledger, marker, lock, and temp paths without changing them.
-- Tidy refuses an unsafe ledger, archive, marker, generated backup, or eligible temp before applying; it does not follow those paths.
-- Snooze and last-nudge publication replace the destination pathname with a private regular file rather than writing through a symlink or FIFO.
-- Other ledger commands, SessionStart, Stop's legacy snooze read, and setup assume trusted user-owned path topology; they do not all implement doctor/tidy's refusal policy. A ledger or `CLAUDE.md` symlink may be read, replaced, or in some missing-path cases followed. Stop can follow a snooze symlink to a regular target when reading, then removes the link pathname if expired. Run `doctor`, and do not point these paths at sensitive files.
+- `doctor` refuses to follow ledger or `CLAUDE.md` symlinks and reports unsafe/nonregular ledger, marker, lock, claim, temp, and archive-artifact paths without changing them. It rejects `HOME` or `PWD` containing tab/newline separators before emitting TSV.
+- Tidy refuses an unsafe ledger, archive, marker, generated backup, or eligible temp before applying; it does not follow those paths. It rejects `HOME` containing tab/newline separators before report or apply.
+- Park, list, match, resume, done, and Stop refuse or stay silent on unsafe ledger paths. Stop classifies snooze/cooldown markers without following symlinks. Snooze and cooldown publication replace an unsafe destination pathname with a private regular file rather than writing through it.
+- SessionStart retains its legacy regular-file test and setup assumes trusted user-owned `CLAUDE.md` topology. Do not point those paths at sensitive files; run `doctor` before maintenance when provenance is uncertain.
 
 ### Recovery limits
 
 - Same-directory rename and append provide process-level single-file publication, not a durability guarantee after power loss. The runtime does not `fsync` file contents or parent directories.
-- Tidy publishes archive and ledger separately. There is no cross-file atomic transaction; a crash between renames can leave an archived record in both files. Rollback on handled errors and `INT`/`TERM`/`HUP` is best effort and may retain the named ledger backup when incomplete.
+- Tidy publishes archive and ledger separately. There is no cross-file atomic transaction; a crash between renames can leave an archived record in both files. Rollback on handled errors and `INT`/`TERM`/`HUP` is best effort; a second catchable signal is deferred during recovery. Incomplete rollback preserves and names surviving ledger/archive backups and quarantine recovery paths. After quarantine renames commit volatile deletion, later artifact cleanup failure returns `verified-with-artifacts` instead of claiming an impossible restore.
 - Locks identify owners by PID only. PID reuse can make an abandoned lock or temp look active, conservatively blocking cleanup. Tidy never reaps someone else's ledger/archive lock.
 - Park alone has an append-only fallback when guarded locking/publication cannot proceed. It preserves data but can place the new record at end of file outside the intended section; `doctor` reports that state and tidy can re-home a valid open record.
 - Setup has no lock and rewrites by redirection. Concurrent setup/manual edits or an interruption can leave a truncated target; recover from its retained backup.
 
-Runtime requirements are `bash`, `awk`, and `date` on macOS or Linux. `jq` is optional; Stop has a fallback serializer.
+Runtime requires `bash`, `awk`, and standard POSIX/BSD/GNU macOS/Linux userland used by the scripts: `cat`, `cksum`, `cmp`, `cp`, `date`, `dd`, `dirname`, `grep`, `kill -0`, `ln`, `ls`, `mkdir`, `mktemp`, `mv`, `rm`, `rmdir`, `sed`, `sleep`, `sort`, `stat`, `tail`, `tr`, and `wc`. The implementation handles BSD/GNU `date`, `stat`, and `mktemp` conventions where they differ. `jq` is optional; Stop has a fallback serializer.
 
 ## Development
 
-Run the complete dependency-free suite under both supported shells:
+The automated suite has a **test-only Python 3 dependency** for structural JSON parsing; the shipped runtime does not. Bash, dash, shellcheck, Git, and Python 3 are expected for full local verification. Run the complete suite under both supported shells:
 
 ```bash
 bash test/run.sh

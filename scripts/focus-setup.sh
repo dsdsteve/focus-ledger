@@ -152,7 +152,19 @@ mkdir -p "$(dirname "$CLAUDE_MD")" || {
 # Publish and verify a new recovery copy before deleting any older generation.
 # A failed or partial copy leaves both the target and every prior backup intact.
 if [ -e "$CLAUDE_MD" ] || [ -L "$CLAUDE_MD" ]; then
-  backup_new=$(mktemp "$CLAUDE_MD.focus-bak.XXXXXXXX") || {
+  backup_epoch=$(date +%s 2>/dev/null) || {
+    cleanup_setup
+    printf 'focus-setup: could not create recovery backup timestamp for %s\n' "$CLAUDE_MD" >&2
+    exit 1
+  }
+  case $backup_epoch in
+    ''|*[!0-9]*)
+      cleanup_setup
+      printf 'focus-setup: invalid recovery backup timestamp for %s\n' "$CLAUDE_MD" >&2
+      exit 1
+      ;;
+  esac
+  backup_new=$(mktemp "$CLAUDE_MD.focus-bak.$backup_epoch.XXXXXX") || {
     cleanup_setup
     printf 'focus-setup: could not create recovery backup for %s\n' "$CLAUDE_MD" >&2
     exit 1

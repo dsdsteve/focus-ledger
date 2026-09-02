@@ -19,5 +19,20 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
-      - name: run suite (bash + dash)
-        run: bash test/run.sh
+      - name: ensure dash is installed
+        shell: bash
+        run: |
+          if command -v dash >/dev/null 2>&1; then
+            exit 0
+          fi
+          if [[ "$RUNNER_OS" == "macOS" ]]; then
+            brew install dash
+          else
+            sudo apt-get update
+            sudo apt-get install -y dash
+          fi
+      - name: run suite under bash
+        run: bash test/run.sh bash
+      - name: run suite under dash
+        if: ${{ always() }}
+        run: bash test/run.sh dash

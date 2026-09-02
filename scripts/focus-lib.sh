@@ -280,6 +280,17 @@ focus_structure_valid() {
     awk -f "$FOCUS_PARSE_AWK" "$1" >/dev/null
 }
 
+# Return success only when every valid open occurrence is inside the exact
+# Parked section. Together with the raw-open multiset equality check this proves
+# promoted/rehomed duplicates were placed correctly rather than merely retained.
+focus_tidy_sections_valid() {
+  focus_parser_ready || return 2
+  FOCUS_PARSE_MODE=tidy-section-check \
+  FOCUS_PARKED_HEAD="$FOCUS_PARKED_HEAD" \
+  FOCUS_SESSION_HEAD="$FOCUS_SESSION_HEAD" \
+    awk -f "$FOCUS_PARSE_AWK" "$1" >/dev/null
+}
+
 # Print rank<TAB>section<TAB>source-line<TAB>escaped-raw-item for every match.
 # Return 0 for one match, 1 for none, and 3 for ambiguity.
 focus_match() {

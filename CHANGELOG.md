@@ -42,10 +42,18 @@ All notable changes to focus-ledger are documented here. Format follows
   publication paths.
 - Stop removes an expired numeric snooze marker before ordinary stale-item
   evaluation and rate-limits repeated stale notices with the cooldown marker.
+- Tidy now places every promoted/re-homed occurrence inside Parked before the
+  first following H2, verifies that section invariant duplicate-aware, preserves
+  non-cooperative pre-rename edits, avoids backups for cleanup-only applies, and
+  reports retained recovery artifacts instead of claiming impossible rollback.
+- Doctor now aligns stale-temp advice with tidy eligibility, treats source/stat/
+  clock/relay failures as operational, inventories archive and marker lock crash
+  blockers read-only, and gives truthful expired-marker guidance for missing or
+  empty ledgers.
 - Epic 1's park-concurrency, truthful-exit, and setup data-loss fixes are
-  source-compatible with a separately maintained `1.1.2` patch and can be
-  cherry-picked together for that purpose. The project has not published that
-  back-port and supports fixes on the latest release.
+  included in 1.2.0 and can be cherry-picked together as an unpublished
+  `1.1.2` patch when a 1.1.x deployment needs only those fixes; maintained
+  releases and ongoing fixes remain on the latest release line.
 
 ### Security
 - Ledger-controlled text remains inert across list, match, SessionStart, Stop,

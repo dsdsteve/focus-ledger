@@ -6,13 +6,30 @@ set -u
 LC_ALL=C
 export LC_ALL
 
+TAB=$(printf '\t')
+NEWLINE='
+'
+case ${HOME:-} in
+  *"$TAB"*|*"$NEWLINE"*)
+    printf 'focus-tidy: HOME must not contain tab or newline characters\n' >&2
+    exit 2
+    ;;
+esac
+
 SCRIPT_DIR=$(CDPATH='' cd "$(dirname "$0")" && pwd)
 if [ -n "${CLAUDE_PLUGIN_ROOT:-}" ] && [ -f "${CLAUDE_PLUGIN_ROOT}/scripts/focus-lib.sh" ]; then
   FOCUS_LIB_DIR="${CLAUDE_PLUGIN_ROOT}/scripts"
 else
   FOCUS_LIB_DIR=$SCRIPT_DIR
 fi
-. "$FOCUS_LIB_DIR/focus-lib.sh"
+if [ ! -f "$FOCUS_LIB_DIR/focus-lib.sh" ] || [ ! -r "$FOCUS_LIB_DIR/focus-lib.sh" ]; then
+  printf 'focus-tidy: shared library is unavailable\n' >&2
+  exit 2
+fi
+. "$FOCUS_LIB_DIR/focus-lib.sh" || {
+  printf 'focus-tidy: shared library failed to load\n' >&2
+  exit 2
+}
 
 mode=report
 case ${1:-} in
@@ -22,7 +39,6 @@ case ${1:-} in
 esac
 [ "$#" -le 1 ] || { printf 'usage: focus-tidy.sh [--apply]\n' >&2; exit 2; }
 
-TAB=$(printf '\t')
 ARCHIVE="$HOME/.claude/focus-ledger-archive.md"
 SNOOZE="$HOME/.claude/.focus-snooze"
 LAST_NUDGE="$HOME/.claude/.focus-last-nudge"
@@ -72,6 +88,8 @@ tidy_marker_lock_token=
 tidy_marker_lock_held=0
 archive_published=0
 ledger_published=0
+ledger_change_count=0
+retained_artifacts=
 
 emit() {
   printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$1" "$2" "$3" "$4" "$5" "$6"
@@ -213,11 +231,54 @@ print_report() {
     "skip=$skip_count;block=$block_count"
 }
 
+path_exists() {
+  [ -e "$1" ] || [ -L "$1" ]
+}
+
+remember_retained_artifact() {
+  retained_path=$1
+  [ -n "$retained_path" ] || return 0
+  path_exists "$retained_path" || return 0
+  if [ -z "$retained_artifacts" ]; then
+    retained_artifacts=$retained_path
+  else
+    retained_artifacts="$retained_artifacts
+$retained_path"
+  fi
+}
+
+remove_owned_file() {
+  remove_owned_path=$1
+  [ -n "$remove_owned_path" ] || return 0
+  rm -f "$remove_owned_path" 2>/dev/null || true
+  if path_exists "$remove_owned_path"; then
+    remember_retained_artifact "$remove_owned_path"
+    return 1
+  fi
+}
+
+verify_owned_lock_released() {
+  verify_lock_path=$1
+  verify_lock_token=$2
+  path_exists "$verify_lock_path" || return 0
+  verify_owner=
+  if [ -f "$verify_lock_path/owner" ] && [ ! -L "$verify_lock_path/owner" ]; then
+    IFS= read -r verify_owner < "$verify_lock_path/owner" || verify_owner=
+  fi
+  # A different recorded token can be a new cooperative owner that acquired
+  # after our release. Only our token or an ownerless leftover is ours to report.
+  if [ -z "$verify_owner" ] || [ "$verify_owner" = "$verify_lock_token" ]; then
+    remember_retained_artifact "$verify_lock_path"
+    return 1
+  fi
+}
+
 cleanup_work_files() {
+  cleanup_work_status=0
   for cleanup_owned in "$archive_stage" "$archive_expected" "$archive_lines" \
     "$ledger_expected" "$pre_open" "$post_open" "$pre_near" "$post_near" \
-    "$pre_retained" "$post_all" "$raw_capture"; do
-    [ -z "$cleanup_owned" ] || rm -f "$cleanup_owned" 2>/dev/null || true
+    "$pre_retained" "$post_all" "$raw_capture" "${FOCUS_TRIM:-}" "${FOCUS_TMP:-}"; do
+    [ -z "$cleanup_owned" ] || remove_owned_file "$cleanup_owned" || cleanup_work_status=1
   done
   archive_stage=
   archive_expected=
@@ -230,16 +291,25 @@ cleanup_work_files() {
   pre_retained=
   post_all=
   raw_capture=
-  focus_rewrite_discard
+  FOCUS_TRIM=
+  FOCUS_TMP=
+  return "$cleanup_work_status"
 }
 
 tidy_marker_lock_release() {
   if [ "$tidy_marker_lock_held" != 0 ]; then
-    focus_lock_drop_owned_dir "$tidy_marker_lock_path" "$tidy_marker_lock_token"
+    tidy_marker_release_path=$tidy_marker_lock_path
+    tidy_marker_release_token=$tidy_marker_lock_token
+    focus_lock_drop_owned_dir "$tidy_marker_release_path" "$tidy_marker_release_token"
+    if ! verify_owned_lock_released "$tidy_marker_release_path" "$tidy_marker_release_token"; then
+      # Keep ownership state so finalization/rollback can retry and report it.
+      return 1
+    fi
     tidy_marker_lock_held=0
   fi
   tidy_marker_lock_path=
   tidy_marker_lock_token=
+  return 0
 }
 
 tidy_marker_lock_acquire() {
@@ -264,17 +334,58 @@ tidy_marker_lock_acquire() {
 }
 
 tidy_archive_lock_release() {
+  tidy_archive_release_status=0
   if [ "$archive_locked" != 0 ]; then
-    focus_lock_drop_owned_dir "$archive_lock" "$archive_lock_token"
+    tidy_archive_release_path=$archive_lock
+    tidy_archive_release_token=$archive_lock_token
+    focus_lock_drop_owned_dir "$tidy_archive_release_path" "$tidy_archive_release_token"
+    verify_owned_lock_released "$tidy_archive_release_path" "$tidy_archive_release_token" ||
+      tidy_archive_release_status=1
     archive_locked=0
   fi
+  return "$tidy_archive_release_status"
 }
 
 release_all() {
-  tidy_marker_lock_release
-  tidy_archive_lock_release
-  focus_write_gate_release
-  focus_lock_release
+  release_status=0
+  if [ -n "${focus_pending_claim:-}" ]; then
+    pending_release_path=$focus_pending_claim
+    pending_release_token=${focus_claim_token:-}
+    focus_lock_drop_pending_claim "$pending_release_path" "$pending_release_token"
+    if path_exists "$pending_release_path"; then
+      remember_retained_artifact "$pending_release_path"
+      release_status=1
+    fi
+    focus_pending_claim=
+  fi
+  tidy_marker_lock_release || release_status=1
+  tidy_archive_lock_release || release_status=1
+  if [ -n "${FOCUS_REAPING:-}" ]; then
+    release_reap_path=$FOCUS_REAP
+    release_reap_token=$FOCUS_REAP_TOKEN
+    focus_lock_drop_owned_dir "$release_reap_path" "$release_reap_token"
+    verify_owned_lock_released "$release_reap_path" "$release_reap_token" || release_status=1
+  fi
+  FOCUS_REAPING=
+  FOCUS_WRITE_GATE=
+  if [ -n "${FOCUS_LOCKED:-}" ]; then
+    release_ledger_path=$FOCUS_LOCK
+    release_ledger_token=$FOCUS_LOCK_TOKEN
+    focus_lock_drop_owned_dir "$release_ledger_path" "$release_ledger_token"
+    verify_owned_lock_released "$release_ledger_path" "$release_ledger_token" || release_status=1
+  fi
+  FOCUS_LOCKED=
+  return "$release_status"
+}
+
+report_retained_artifacts() {
+  [ -z "$retained_artifacts" ] && return 0
+  while IFS= read -r retained_path; do
+    [ -n "$retained_path" ] && path_exists "$retained_path" || continue
+    printf 'focus-tidy: retained recovery artifact: %s\n' "$retained_path" >&2
+  done <<EOF_RETAINED
+$retained_artifacts
+EOF_RETAINED
 }
 
 # Tidy owns no stale-lock cleanup policy. It may wait for a cooperative owner
@@ -320,14 +431,18 @@ tidy_archive_lock_acquire() {
 
 fail_locked() {
   fail_message=$1
-  cleanup_work_files
-  [ -z "$archive_backup" ] || rm -f "$archive_backup" 2>/dev/null || true
+  fail_cleanup_status=0
+  cleanup_work_files || fail_cleanup_status=1
+  [ -z "$archive_backup" ] || remove_owned_file "$archive_backup" || fail_cleanup_status=1
   if [ "$ledger_backup_owned" = 1 ] && [ "$ledger_published" = 0 ]; then
-    rm -f "$ledger_backup" 2>/dev/null || true
-    ledger_backup_owned=0
+    remove_owned_file "$ledger_backup" || fail_cleanup_status=1
+    [ "$fail_cleanup_status" = 0 ] && ledger_backup_owned=0
   fi
-  release_all
+  release_all || fail_cleanup_status=1
   printf 'focus-tidy: %s\n' "$fail_message" >&2
+  if [ "$fail_cleanup_status" != 0 ]; then
+    report_retained_artifacts
+  fi
   exit 2
 }
 
@@ -335,11 +450,17 @@ append_quarantine_pair() {
   quarantine_original=$1
   quarantine_path=$2
   quarantine_copy="$quarantine_path.restore"
-  if [ -e "$quarantine_copy" ] || [ -L "$quarantine_copy" ] ||
-     ! (umask 077; set -C; cat "$quarantine_path" > "$quarantine_copy") 2>/dev/null ||
-     ! cmp -s "$quarantine_path" "$quarantine_copy"; then
-    rm -f "$quarantine_copy" 2>/dev/null || true
+  if [ -e "$quarantine_copy" ] || [ -L "$quarantine_copy" ]; then
     mv "$quarantine_path" "$quarantine_original" 2>/dev/null || true
+    return 1
+  fi
+  if ! (umask 077; set -C; cat "$quarantine_path" > "$quarantine_copy") 2>/dev/null ||
+     ! cmp -s "$quarantine_path" "$quarantine_copy"; then
+    # Restore from the quarantine first. Delete the new recovery copy only
+    # after the original is back; otherwise leave both sources for rollback.
+    if mv "$quarantine_path" "$quarantine_original" 2>/dev/null; then
+      rm -f "$quarantine_copy" 2>/dev/null || true
+    fi
     return 1
   fi
   quarantine_entry=$(printf '%s\t%s\t%s' "$quarantine_original" "$quarantine_path" "$quarantine_copy")
@@ -355,20 +476,46 @@ $quarantine_entry"
 restore_inflight_quarantine() {
   [ -n "$inflight_original" ] || return 0
   inflight_status=0
-  if [ ! -e "$inflight_original" ] && [ ! -L "$inflight_original" ] &&
-     [ -f "$inflight_quarantine" ] && [ ! -L "$inflight_quarantine" ]; then
-    if ln "$inflight_quarantine" "$inflight_original" 2>/dev/null; then
-      rm -f "$inflight_quarantine" 2>/dev/null || inflight_status=1
+  inflight_source=
+  if [ ! -e "$inflight_original" ] && [ ! -L "$inflight_original" ]; then
+    if [ -f "$inflight_quarantine" ] && [ ! -L "$inflight_quarantine" ]; then
+      inflight_source=$inflight_quarantine
+    elif [ -f "$inflight_copy" ] && [ ! -L "$inflight_copy" ]; then
+      inflight_source=$inflight_copy
+    fi
+    if [ -n "$inflight_source" ] && ln "$inflight_source" "$inflight_original" 2>/dev/null; then
+      remove_owned_file "$inflight_quarantine" || inflight_status=1
+      remove_owned_file "$inflight_copy" || inflight_status=1
+    else
+      # Failed restoration must preserve every remaining source, especially a
+      # .restore file when the quarantine itself has disappeared.
+      [ -n "$inflight_source" ] || inflight_status=1
+      inflight_status=1
+      remember_retained_artifact "$inflight_quarantine"
+      remember_retained_artifact "$inflight_copy"
+    fi
+  else
+    # If another path already exists, remove recovery copies only when one
+    # proves it has the same bytes. Otherwise preserve them for manual recovery.
+    inflight_matching_source=
+    if [ -f "$inflight_quarantine" ] && [ ! -L "$inflight_quarantine" ] &&
+       cmp -s "$inflight_original" "$inflight_quarantine"; then
+      inflight_matching_source=$inflight_quarantine
+    elif [ -f "$inflight_copy" ] && [ ! -L "$inflight_copy" ] &&
+         cmp -s "$inflight_original" "$inflight_copy"; then
+      inflight_matching_source=$inflight_copy
+    elif ! path_exists "$inflight_quarantine" && ! path_exists "$inflight_copy"; then
+      inflight_matching_source=none
+    fi
+    if [ -n "$inflight_matching_source" ]; then
+      remove_owned_file "$inflight_quarantine" || inflight_status=1
+      remove_owned_file "$inflight_copy" || inflight_status=1
     else
       inflight_status=1
+      remember_retained_artifact "$inflight_quarantine"
+      remember_retained_artifact "$inflight_copy"
     fi
-  elif { [ -e "$inflight_original" ] || [ -L "$inflight_original" ]; } &&
-       [ ! -e "$inflight_quarantine" ] && [ ! -L "$inflight_quarantine" ]; then
-    :
-  else
-    inflight_status=1
   fi
-  [ -z "$inflight_copy" ] || rm -f "$inflight_copy" 2>/dev/null || inflight_status=1
   if [ "$inflight_status" = 0 ]; then
     inflight_original=
     inflight_quarantine=
@@ -393,7 +540,8 @@ restore_quarantines() {
       if [ "$restore_marker" = 1 ]; then
         # A newer marker won the race after quarantine; preserve it rather than
         # replacing it with the expired pre-state.
-        rm -f "$quarantine_path" "$quarantine_copy" 2>/dev/null || restore_quarantine_status=1
+        remove_owned_file "$quarantine_path" || restore_quarantine_status=1
+        remove_owned_file "$quarantine_copy" || restore_quarantine_status=1
       else
         restore_quarantine_status=1
       fi
@@ -405,9 +553,11 @@ restore_quarantines() {
         restore_source=$quarantine_copy
       fi
       if [ -n "$restore_source" ] && ln "$restore_source" "$original_path" 2>/dev/null; then
-        rm -f "$quarantine_path" "$quarantine_copy" 2>/dev/null || restore_quarantine_status=1
+        remove_owned_file "$quarantine_path" || restore_quarantine_status=1
+        remove_owned_file "$quarantine_copy" || restore_quarantine_status=1
       elif [ "$restore_marker" = 1 ] && { [ -e "$original_path" ] || [ -L "$original_path" ]; }; then
-        rm -f "$quarantine_path" "$quarantine_copy" 2>/dev/null || restore_quarantine_status=1
+        remove_owned_file "$quarantine_path" || restore_quarantine_status=1
+        remove_owned_file "$quarantine_copy" || restore_quarantine_status=1
       else
         restore_quarantine_status=1
       fi
@@ -423,15 +573,18 @@ remove_quarantines() {
   [ -z "$quarantine_pairs" ] && return 0
   remove_quarantine_status=0
   while IFS="$TAB" read -r original_path quarantine_path quarantine_copy; do
-    : "$original_path" "$quarantine_copy"
-    rm -f "$quarantine_path" 2>/dev/null || remove_quarantine_status=1
-  done <<EOF_QUARANTINES
-$quarantine_pairs
-EOF_QUARANTINES
-  [ "$remove_quarantine_status" = 0 ] || return 1
-  while IFS="$TAB" read -r original_path quarantine_path quarantine_copy; do
-    : "$original_path" "$quarantine_path"
-    rm -f "$quarantine_copy" 2>/dev/null || remove_quarantine_status=1
+    : "$original_path"
+    # Quarantine renames are the logical deletion commit. Cleanup after this
+    # point is best effort: a failed unlink leaves a recovery artifact and must
+    # never trigger an impossible rollback after earlier sources were removed.
+    if remove_owned_file "$quarantine_path"; then
+      remove_owned_file "$quarantine_copy" || remove_quarantine_status=1
+    else
+      # Keep the verified copy whenever the payload could not be removed; it may
+      # be the only trustworthy bytes if the payload path was replaced.
+      remember_retained_artifact "$quarantine_copy"
+      remove_quarantine_status=1
+    fi
   done <<EOF_QUARANTINES
 $quarantine_pairs
 EOF_QUARANTINES
@@ -459,38 +612,92 @@ restore_regular_from_backup() {
 
 rollback_and_fail() {
   rollback_reason=$1
-  trap - INT TERM HUP
+  # A second catchable signal cannot interrupt restoration or lock release.
+  trap '' INT TERM HUP
   rollback_ok=1
   restore_inflight_quarantine || rollback_ok=0
-  tidy_marker_lock_release
+  tidy_marker_lock_release || rollback_ok=0
   restore_quarantines || rollback_ok=0
-  if [ "$ledger_published" != 0 ]; then
-    restore_regular_from_backup "$ledger_backup" "$FOCUS_LEDGER" || rollback_ok=0
+
+  if [ "$ledger_published" = 1 ]; then
+    if [ -f "$FOCUS_LEDGER" ] && [ ! -L "$FOCUS_LEDGER" ] &&
+       [ -n "$ledger_expected" ] && cmp -s "$FOCUS_LEDGER" "$ledger_expected"; then
+      restore_regular_from_backup "$ledger_backup" "$FOCUS_LEDGER" || rollback_ok=0
+    elif [ -f "$FOCUS_LEDGER" ] && [ ! -L "$FOCUS_LEDGER" ] &&
+         cmp -s "$FOCUS_LEDGER" "$ledger_backup"; then
+      :
+    else
+      rollback_ok=0
+    fi
+  elif [ "$ledger_published" = maybe ]; then
+    if [ -f "$FOCUS_LEDGER" ] && [ ! -L "$FOCUS_LEDGER" ] &&
+       [ -n "$ledger_expected" ] && cmp -s "$FOCUS_LEDGER" "$ledger_expected"; then
+      restore_regular_from_backup "$ledger_backup" "$FOCUS_LEDGER" || rollback_ok=0
+    elif [ -f "$FOCUS_LEDGER" ] && [ ! -L "$FOCUS_LEDGER" ] &&
+         cmp -s "$FOCUS_LEDGER" "$ledger_backup"; then
+      :
+    else
+      # Unknown bytes belong to a non-cooperative writer; never overwrite them.
+      rollback_ok=0
+    fi
   fi
+
   if [ "$archive_published" != 0 ]; then
     if [ "$archive_existed" = 1 ]; then
-      restore_regular_from_backup "$archive_backup" "$ARCHIVE" || rollback_ok=0
+      if [ -f "$ARCHIVE" ] && [ ! -L "$ARCHIVE" ] &&
+         [ -n "$archive_expected" ] && cmp -s "$ARCHIVE" "$archive_expected"; then
+        restore_regular_from_backup "$archive_backup" "$ARCHIVE" || rollback_ok=0
+      elif [ -f "$ARCHIVE" ] && [ ! -L "$ARCHIVE" ] && cmp -s "$ARCHIVE" "$archive_backup"; then
+        :
+      else
+        rollback_ok=0
+      fi
     elif [ ! -e "$ARCHIVE" ] && [ ! -L "$ARCHIVE" ]; then
       [ "$archive_published" = maybe ] || rollback_ok=0
-    elif [ -f "$ARCHIVE" ] && [ ! -L "$ARCHIVE" ]; then
-      rm -f "$ARCHIVE" 2>/dev/null || rollback_ok=0
+    elif [ -f "$ARCHIVE" ] && [ ! -L "$ARCHIVE" ] &&
+         [ -n "$archive_expected" ] && cmp -s "$ARCHIVE" "$archive_expected"; then
+      remove_owned_file "$ARCHIVE" || rollback_ok=0
     else
       rollback_ok=0
     fi
   fi
-  if [ "$ledger_published" = 0 ] && [ "$ledger_backup_owned" = 1 ]; then
-    rm -f "$ledger_backup" 2>/dev/null || rollback_ok=0
-    ledger_backup_owned=0
-  fi
-  cleanup_work_files
+
+  cleanup_work_files || rollback_ok=0
+  release_all || rollback_ok=0
+
   if [ "$rollback_ok" = 1 ]; then
-    [ -z "$archive_backup" ] || rm -f "$archive_backup" 2>/dev/null || true
+    [ -z "$archive_backup" ] || remove_owned_file "$archive_backup" || rollback_ok=0
+    if [ "$ledger_published" = 0 ] && [ "$ledger_backup_owned" = 1 ]; then
+      remove_owned_file "$ledger_backup" || rollback_ok=0
+      [ "$rollback_ok" = 0 ] || ledger_backup_owned=0
+    fi
   fi
-  release_all
+
+  if [ "$rollback_ok" != 1 ]; then
+    remember_retained_artifact "$ledger_backup"
+    remember_retained_artifact "$archive_backup"
+    remember_retained_artifact "$inflight_quarantine"
+    remember_retained_artifact "$inflight_copy"
+    if [ -n "$quarantine_pairs" ]; then
+      while IFS="$TAB" read -r recovery_original recovery_quarantine recovery_copy; do
+        : "$recovery_original"
+        remember_retained_artifact "$recovery_quarantine"
+        remember_retained_artifact "$recovery_copy"
+      done <<EOF_RECOVERY
+$quarantine_pairs
+EOF_RECOVERY
+    fi
+  fi
+
   if [ "$rollback_ok" = 1 ]; then
-    printf 'focus-tidy: apply failed (%s); ledger and archive restored from backups; markers and temps left unchanged\n' "$rollback_reason" >&2
+    if [ "$ledger_published" = 0 ] && [ "$archive_published" = 0 ]; then
+      printf 'focus-tidy: apply failed (%s); cleanup targets restored; no ledger or archive publication occurred\n' "$rollback_reason" >&2
+    else
+      printf 'focus-tidy: apply failed (%s); ledger and archive restored from backups; markers and temps left unchanged\n' "$rollback_reason" >&2
+    fi
   else
-    printf 'focus-tidy: apply failed (%s); rollback was incomplete — recover from %s\n' "$rollback_reason" "$ledger_backup" >&2
+    printf 'focus-tidy: apply failed (%s); rollback or artifact cleanup was incomplete; surviving recovery paths follow\n' "$rollback_reason" >&2
+    report_retained_artifacts
   fi
   exit 2
 }
@@ -519,12 +726,12 @@ quarantine_marker_if_expired() {
     inflight_original=
     inflight_quarantine=
     inflight_copy=
-    tidy_marker_lock_release
+    tidy_marker_lock_release || return 1
     return 0
   fi
   case $marker_recheck_state in
-    missing|active) tidy_marker_lock_release; return 0 ;;
-    *) tidy_marker_lock_release; return 1 ;;
+    missing|active) tidy_marker_lock_release || return 1; return 0 ;;
+    *) tidy_marker_lock_release || true; return 1 ;;
   esac
 }
 
@@ -548,6 +755,13 @@ quarantine_temp_if_stale() {
   inflight_original=
   inflight_quarantine=
   inflight_copy=
+}
+
+tidy_test_rollback_after_quarantine() {
+  if [ "${FOCUS_TIDY_TEST_FAIL:-}" = rollback-after-first-quarantine ] &&
+     [ "$quarantine_count" -gt 0 ]; then
+    rollback_and_fail 'test-only rollback after first quarantine'
+  fi
 }
 
 capture_sorted_records() {
@@ -629,7 +843,12 @@ if [ "$block_count" -gt 0 ]; then
   fail_locked 'unsafe paths or ledger structure block apply; run report and doctor'
 fi
 if [ "$action_total" -eq 0 ]; then
-  release_all
+  if ! release_all; then
+    report_retained_artifacts
+    emit APPLY verified-with-artifacts "$FOCUS_LEDGER" - 'no mutation performed' \
+      'fresh derivation found no actions, but owned lock cleanup was incomplete'
+    exit 2
+  fi
   emit APPLY no-op "$FOCUS_LEDGER" - 'no mutation performed' \
     'fresh in-lock derivation found no actions; no backup was created'
   exit 0
@@ -656,30 +875,32 @@ if [ "$archive_count" -gt 0 ]; then
   fi
 fi
 
-timestamp=$(date '+%Y%m%dT%H%M%S' 2>/dev/null) || fail_locked 'could not create backup timestamp'
-ledger_backup=$(mktemp "$FOCUS_LEDGER.backup.$timestamp.XXXXXX" 2>/dev/null) ||
-  fail_locked 'could not create same-directory ledger backup'
-if [ -L "$ledger_backup" ] || [ ! -f "$ledger_backup" ]; then
-  fail_locked 'ledger backup path is not a safe regular file'
-fi
-ledger_backup_owned=1
-if ! cat "$FOCUS_LEDGER" > "$ledger_backup" ||
-   ! cmp -s "$FOCUS_LEDGER" "$ledger_backup"; then
-  fail_locked 'ledger backup verification failed'
-fi
+ledger_change_count=$((archive_count + promote_count + rehome_count))
+if [ "$ledger_change_count" -gt 0 ]; then
+  timestamp=$(date '+%Y%m%dT%H%M%S' 2>/dev/null) || fail_locked 'could not create backup timestamp'
+  ledger_backup=$(mktemp "$FOCUS_LEDGER.backup.$timestamp.XXXXXX" 2>/dev/null) ||
+    fail_locked 'could not create same-directory ledger backup'
+  if [ -L "$ledger_backup" ] || [ ! -f "$ledger_backup" ]; then
+    fail_locked 'ledger backup path is not a safe regular file'
+  fi
+  ledger_backup_owned=1
+  if ! cat "$FOCUS_LEDGER" > "$ledger_backup" ||
+     ! cmp -s "$FOCUS_LEDGER" "$ledger_backup"; then
+    fail_locked 'ledger backup verification failed'
+  fi
 
-if [ "$archive_count" -gt 0 ] && [ -e "$ARCHIVE" ]; then
-  archive_existed=1
-  archive_backup=$(mktemp "$ARCHIVE.backup.$timestamp.XXXXXX" 2>/dev/null) ||
-    fail_locked 'could not create same-directory archive backup'
-  if [ -L "$archive_backup" ] || [ ! -f "$archive_backup" ] ||
-     ! cat "$ARCHIVE" > "$archive_backup" ||
-     ! cmp -s "$ARCHIVE" "$archive_backup"; then
-    fail_locked 'archive backup verification failed'
+  if [ "$archive_count" -gt 0 ] && [ -e "$ARCHIVE" ]; then
+    archive_existed=1
+    archive_backup=$(mktemp "$ARCHIVE.backup.$timestamp.XXXXXX" 2>/dev/null) ||
+      fail_locked 'could not create same-directory archive backup'
+    if [ -L "$archive_backup" ] || [ ! -f "$archive_backup" ] ||
+       ! cat "$ARCHIVE" > "$archive_backup" ||
+       ! cmp -s "$ARCHIVE" "$archive_backup"; then
+      fail_locked 'archive backup verification failed'
+    fi
   fi
 fi
 
-ledger_change_count=$((archive_count + promote_count + rehome_count))
 if [ "$ledger_change_count" -gt 0 ]; then
   focus_rewrite_begin || fail_locked 'could not create same-directory ledger stage'
   if ! focus_tidy_rewrite "$today_days" "$archive_days" > "$FOCUS_TMP" ||
@@ -693,12 +914,14 @@ if [ "$ledger_change_count" -gt 0 ]; then
   cat "$FOCUS_TMP" > "$ledger_expected" || fail_locked 'could not snapshot expected ledger'
 fi
 
-pre_open=$(mktemp "$FOCUS_LEDGER.verify-open.XXXXXX" 2>/dev/null) || fail_locked 'could not create open-line verification file'
-pre_near=$(mktemp "$FOCUS_LEDGER.verify-near.XXXXXX" 2>/dev/null) || fail_locked 'could not create near-miss verification file'
-pre_retained=$(mktemp "$FOCUS_LEDGER.verify-retained.XXXXXX" 2>/dev/null) || fail_locked 'could not create retained-record verification file'
-capture_sorted_records open "$FOCUS_LEDGER" "$pre_open" || fail_locked 'could not capture open-line multiset'
-capture_sorted_records near "$FOCUS_LEDGER" "$pre_near" || fail_locked 'could not capture near-miss multiset'
-capture_sorted_records retained "$FOCUS_LEDGER" "$pre_retained" || fail_locked 'could not capture retained-record multiset'
+if [ "$ledger_change_count" -gt 0 ]; then
+  pre_open=$(mktemp "$FOCUS_LEDGER.verify-open.XXXXXX" 2>/dev/null) || fail_locked 'could not create open-line verification file'
+  pre_near=$(mktemp "$FOCUS_LEDGER.verify-near.XXXXXX" 2>/dev/null) || fail_locked 'could not create near-miss verification file'
+  pre_retained=$(mktemp "$FOCUS_LEDGER.verify-retained.XXXXXX" 2>/dev/null) || fail_locked 'could not create retained-record verification file'
+  capture_sorted_records open "$FOCUS_LEDGER" "$pre_open" || fail_locked 'could not capture open-line multiset'
+  capture_sorted_records near "$FOCUS_LEDGER" "$pre_near" || fail_locked 'could not capture near-miss multiset'
+  capture_sorted_records retained "$FOCUS_LEDGER" "$pre_retained" || fail_locked 'could not capture retained-record multiset'
+fi
 
 if [ "$archive_count" -gt 0 ]; then
   archive_lines=$(mktemp "$FOCUS_LEDGER.archive-lines.XXXXXX" 2>/dev/null) ||
@@ -710,9 +933,9 @@ if [ "$archive_count" -gt 0 ]; then
   archive_stage=$(mktemp "$ARCHIVE.tmp.XXXXXX" 2>/dev/null) ||
     fail_locked 'could not create same-directory archive stage'
   {
-    if [ "$archive_existed" = 1 ] && [ -s "$ARCHIVE" ]; then
-      cat "$ARCHIVE" || exit 1
-      if [ -n "$(tail -c 1 "$ARCHIVE")" ]; then printf '\n'; fi
+    if [ "$archive_existed" = 1 ] && [ -s "$archive_backup" ]; then
+      cat "$archive_backup" || exit 1
+      if [ -n "$(tail -c 1 "$archive_backup")" ]; then printf '\n'; fi
       printf '\n'
     else
       printf '# Focus ledger archive\n\n'
@@ -747,42 +970,52 @@ if [ "$archive_count" -gt 0 ]; then
 fi
 
 if [ "$ledger_change_count" -gt 0 ]; then
+  if ! focus_rewrite_source_unchanged; then
+    # Publication was never attempted. Keep the concurrent ledger bytes and
+    # restore only any archive version owned by this transaction.
+    ledger_published=0
+    rollback_and_fail 'ledger changed before atomic publish'
+  fi
   ledger_published=maybe
-  if ! focus_rewrite_source_unchanged || ! mv -f "$FOCUS_TMP" "$FOCUS_LEDGER"; then
+  if ! mv -f "$FOCUS_TMP" "$FOCUS_LEDGER"; then
     rollback_and_fail 'ledger atomic publish failed'
   fi
   FOCUS_TMP=
   ledger_published=1
 fi
 
-# Test-only corruption seam used solely to prove the real post-verifiers drive
-# rollback. It is inert unless set and is never mentioned by command prompts.
-if [ "${FOCUS_TIDY_TEST_FAIL:-}" = corrupt-ledger-before-verify ]; then
-  printf '# injected tidy verification fault\n' >> "$FOCUS_LEDGER" ||
-    rollback_and_fail 'could not inject verification fault'
+# Test-only rollback seam. It exercises the real owned-publication rollback
+# path without corrupting or otherwise mutating unowned live bytes. Cleanup-only
+# applies have no owned ledger/archive publication and deliberately ignore it.
+if [ "${FOCUS_TIDY_TEST_FAIL:-}" = rollback-after-publish ] &&
+   { [ "$ledger_published" != 0 ] || [ "$archive_published" != 0 ]; }; then
+  rollback_and_fail 'test-only rollback after owned publication'
 fi
 
-post_open=$(mktemp "$FOCUS_LEDGER.verify-open-post.XXXXXX" 2>/dev/null) ||
-  rollback_and_fail 'could not create post-verify open-line file'
-post_near=$(mktemp "$FOCUS_LEDGER.verify-near-post.XXXXXX" 2>/dev/null) ||
-  rollback_and_fail 'could not create post-verify near-miss file'
-post_all=$(mktemp "$FOCUS_LEDGER.verify-all-post.XXXXXX" 2>/dev/null) ||
-  rollback_and_fail 'could not create post-verify retained-record file'
-capture_sorted_records open "$FOCUS_LEDGER" "$post_open" ||
-  rollback_and_fail 'could not read post-state open lines'
-capture_sorted_records near "$FOCUS_LEDGER" "$post_near" ||
-  rollback_and_fail 'could not read post-state near-miss lines'
-capture_sorted_records all "$FOCUS_LEDGER" "$post_all" ||
-  rollback_and_fail 'could not read post-state retained records'
+if [ "$ledger_change_count" -gt 0 ]; then
+  post_open=$(mktemp "$FOCUS_LEDGER.verify-open-post.XXXXXX" 2>/dev/null) ||
+    rollback_and_fail 'could not create post-verify open-line file'
+  post_near=$(mktemp "$FOCUS_LEDGER.verify-near-post.XXXXXX" 2>/dev/null) ||
+    rollback_and_fail 'could not create post-verify near-miss file'
+  post_all=$(mktemp "$FOCUS_LEDGER.verify-all-post.XXXXXX" 2>/dev/null) ||
+    rollback_and_fail 'could not create post-verify retained-record file'
+  capture_sorted_records open "$FOCUS_LEDGER" "$post_open" ||
+    rollback_and_fail 'could not read post-state open lines'
+  capture_sorted_records near "$FOCUS_LEDGER" "$post_near" ||
+    rollback_and_fail 'could not read post-state near-miss lines'
+  capture_sorted_records all "$FOCUS_LEDGER" "$post_all" ||
+    rollback_and_fail 'could not read post-state retained records'
 
-if ! focus_structure_valid "$FOCUS_LEDGER" ||
-   ! cmp -s "$pre_open" "$post_open" ||
-   ! cmp -s "$pre_near" "$post_near" ||
-   ! cmp -s "$pre_retained" "$post_all"; then
-  rollback_and_fail 'post-verify heading or raw-record multiset invariant failed'
-fi
-if [ "$ledger_change_count" -gt 0 ] && ! cmp -s "$FOCUS_LEDGER" "$ledger_expected"; then
-  rollback_and_fail 'post-verify untouched-ledger bytes differ from the staged result'
+  if ! focus_structure_valid "$FOCUS_LEDGER" ||
+     ! focus_tidy_sections_valid "$FOCUS_LEDGER" ||
+     ! cmp -s "$pre_open" "$post_open" ||
+     ! cmp -s "$pre_near" "$post_near" ||
+     ! cmp -s "$pre_retained" "$post_all"; then
+    rollback_and_fail 'post-verify heading, section/action, or raw-record multiset invariant failed'
+  fi
+  if ! cmp -s "$FOCUS_LEDGER" "$ledger_expected"; then
+    rollback_and_fail 'post-verify untouched-ledger bytes differ from the staged result'
+  fi
 fi
 if [ "$archive_count" -gt 0 ] && ! cmp -s "$ARCHIVE" "$archive_expected"; then
   rollback_and_fail 'post-verify archive multiplicity differs from the staged result'
@@ -791,35 +1024,51 @@ fi
 # Volatile cleanup begins only after both published files and every invariant
 # verify. Targets are first renamed to same-directory quarantine names; if any
 # rename fails, all prior targets can be restored before core rollback.
-if [ "$remove_snooze" = 1 ] && ! quarantine_marker_if_expired "$SNOOZE"; then
-  rollback_and_fail 'snooze cleanup could not be quarantined safely'
+if [ "$remove_snooze" = 1 ]; then
+  quarantine_marker_if_expired "$SNOOZE" ||
+    rollback_and_fail 'snooze cleanup could not be quarantined safely'
+  tidy_test_rollback_after_quarantine
 fi
-if [ "$remove_last_nudge" = 1 ] && ! quarantine_marker_if_expired "$LAST_NUDGE"; then
-  rollback_and_fail 'last-nudge cleanup could not be quarantined safely'
+if [ "$remove_last_nudge" = 1 ]; then
+  quarantine_marker_if_expired "$LAST_NUDGE" ||
+    rollback_and_fail 'last-nudge cleanup could not be quarantined safely'
+  tidy_test_rollback_after_quarantine
 fi
 if [ -n "$remove_temp_paths" ]; then
   while IFS= read -r cleanup_target; do
-    [ -z "$cleanup_target" ] || quarantine_temp_if_stale "$cleanup_target" ||
-      rollback_and_fail 'temp cleanup could not be quarantined safely'
+    if [ -n "$cleanup_target" ]; then
+      quarantine_temp_if_stale "$cleanup_target" ||
+        rollback_and_fail 'temp cleanup could not be quarantined safely'
+      tidy_test_rollback_after_quarantine
+    fi
   done <<EOF_TEMPS
 $remove_temp_paths
 EOF_TEMPS
 fi
-# Quarantine journals and recovery copies are complete. Treat deletion as the
-# cleanup commit point and defer catchable signals until owned locks are released.
+# Quarantine renames are now the logical deletion commit. From here onward,
+# catchable signals are deferred until owned locks are released. Unlink failures
+# retain truthful recovery artifacts and never attempt an impossible rollback.
 trap '' INT TERM HUP
-if ! remove_quarantines; then
-  rollback_and_fail 'quarantine cleanup could not be deleted safely'
-fi
-
-cleanup_work_files
-# Finalization cannot introduce user-data loss; defer signals across the tiny
-# archive-backup removal and owned-lock release window.
-trap '' INT TERM HUP
-[ -z "$archive_backup" ] || rm -f "$archive_backup" 2>/dev/null || true
-release_all
+finalize_status=0
+remove_quarantines || finalize_status=1
+cleanup_work_files || finalize_status=1
+[ -z "$archive_backup" ] || remove_owned_file "$archive_backup" || finalize_status=1
+release_all || finalize_status=1
 trap - INT TERM HUP
+
+if [ -n "$ledger_backup" ]; then
+  verification_detail="post-verify passed with exact open/near-miss/retained-record multisets and section/action placement; recovery backup=$ledger_backup"
+else
+  verification_detail='post-verify passed; ledger bytes and mtime were not mutated and no recovery backup was created'
+fi
+if [ "$finalize_status" != 0 ]; then
+  report_retained_artifacts
+  emit APPLY verified-with-artifacts "$FOCUS_LEDGER" - \
+    "archive=$archive_count;promote=$promote_count;rehome=$rehome_count;remove=$quarantine_count" \
+    "$verification_detail; automatic artifact cleanup was incomplete"
+  exit 2
+fi
 emit APPLY verified "$FOCUS_LEDGER" - \
   "archive=$archive_count;promote=$promote_count;rehome=$rehome_count;remove=$quarantine_count" \
-  "post-verify passed with exact open/near-miss/retained-record multisets; recovery backup=$ledger_backup"
+  "$verification_detail"
 exit 0

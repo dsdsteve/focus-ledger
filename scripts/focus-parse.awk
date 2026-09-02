@@ -39,8 +39,9 @@ BEGIN {
 
   diagnostic_mode = (mode == "doctor" || mode == "tidy-report" || \
     mode == "tidy-rewrite" || mode == "tidy-archive" || \
-    mode == "raw-open" || mode == "raw-near" || \
-    mode == "raw-retained" || mode == "structure-check")
+    mode == "tidy-section-check" || mode == "raw-open" || \
+    mode == "raw-near" || mode == "raw-retained" || \
+    mode == "structure-check")
 
   if (mode == "date-days") {
     date_days_result = calendar_days(calendar_date)
@@ -409,6 +410,12 @@ function flush_rewrite_blanks(   blank_i) {
     diagnostic_source_count = FNR
     if (is_comment) next
 
+    # The first real H2 after the one exact Parked heading is the section
+    # boundary for tidy moves. It may be Scratch, Notes, or This session.
+    if (/^## / && parked_heading_count == 1 && parked_boundary_line == 0 && \
+        FNR > parked_heading_line[1]) {
+      parked_boundary_line = FNR
+    }
     if ($0 == parked_head) {
       parked_heading_count++
       parked_heading_line[parked_heading_count] = FNR
@@ -461,6 +468,11 @@ function flush_rewrite_blanks(   blank_i) {
               "move byte-for-byte from outside known sections to Parked", $0)
           }
         }
+      } else if (mode == "tidy-section-check" && diagnostic_section != "parked") {
+        # Count physical occurrences, not unique line text. Combined with the
+        # raw-open multiset check, zero proves every promoted/rehomed occurrence
+        # now resides inside Parked even when duplicate records are identical.
+        pending_move_count++
       }
       next
     }
@@ -585,6 +597,10 @@ END {
   if (diagnostic_mode) {
     collect_structure_issues()
     if (mode == "structure-check") exit !structure_valid()
+    if (mode == "tidy-section-check") {
+      if (!structure_valid()) exit 2
+      exit (pending_move_count != 0)
+    }
     if (mode == "raw-retained") {
       if (!structure_valid()) exit 2
       for (diagnostic_i = 1; diagnostic_i <= diagnostic_source_count; diagnostic_i++) {
@@ -595,7 +611,7 @@ END {
     if (mode == "tidy-rewrite") {
       if (!structure_valid()) exit 2
       for (diagnostic_i = 1; diagnostic_i <= diagnostic_source_count; diagnostic_i++) {
-        if (diagnostic_i == session_heading_line[1]) {
+        if (diagnostic_i == parked_boundary_line) {
           for (move_i = 1; move_i <= diagnostic_source_count; move_i++) {
             if (tidy_action[move_i] == "promote" || tidy_action[move_i] == "rehome") {
               print diagnostic_source_line[move_i]
