@@ -748,6 +748,32 @@ run_setup_check() {
   else fail=$((fail+1)); printf '  FAIL [%s] setup: after remove blocks=%s kept=%s (want 0/1)\n' "$sh_bin" "$n2" "$kept2"; fi
   rm -rf "$home"
 
+  # Regression (perms family): a fresh-install CLAUDE.md must publish at the
+  # umask-based mode a plain create produces, not mktemp's 0600. Both umasks are
+  # chosen so the expected mode differs from mktemp's 0600, so each case fails if
+  # the derivation is dropped; 027 also proves a restrictive umask is honored.
+  for perm_pair in "022 644" "027 640"; do
+    perm_umask=${perm_pair% *}; perm_expected=${perm_pair#* }
+    perm_home=$(mktemp -d)
+    ( cd "$perm_home" && umask "$perm_umask" && env -i HOME="$perm_home" PATH="$PATH" \
+      "$sh_bin" "$ROOT/scripts/focus-setup.sh" local >/dev/null 2>&1 )
+    perm_actual=$(test_mode_octal "$perm_home/CLAUDE.md")
+    if [ "$perm_actual" = "$perm_expected" ]; then
+      pass=$((pass+1)); printf '  ok   [%s] setup: fresh CLAUDE.md honors umask %s (%s)\n' "$sh_bin" "$perm_umask" "$perm_expected"
+    else fail=$((fail+1)); printf '  FAIL [%s] setup: fresh CLAUDE.md umask %s mode=%s want %s\n' "$sh_bin" "$perm_umask" "$perm_actual" "$perm_expected"; fi
+    rm -rf "$perm_home"
+  done
+  # Existing target keeps its own mode across an install (the cp -p path, which
+  # the fresh-install chmod must not disturb).
+  keep_home=$(mktemp -d); keep_md="$keep_home/CLAUDE.md"
+  printf '# rules\n' > "$keep_md"; chmod 640 "$keep_md"
+  ( cd "$keep_home" && env -i HOME="$keep_home" PATH="$PATH" "$sh_bin" "$ROOT/scripts/focus-setup.sh" local >/dev/null 2>&1 )
+  keep_actual=$(test_mode_octal "$keep_md")
+  if [ "$keep_actual" = 640 ]; then
+    pass=$((pass+1)); printf '  ok   [%s] setup: existing CLAUDE.md keeps its mode 640\n' "$sh_bin"
+  else fail=$((fail+1)); printf '  FAIL [%s] setup: existing CLAUDE.md mode=%s want 640\n' "$sh_bin" "$keep_actual"; fi
+  rm -rf "$keep_home"
+
   # Guard (story 1.3): unbalanced or out-of-order markers must refuse before
   # any write — on install AND --remove. The BEGIN-only fixture mirrors the
   # reproduced truncation bug: user content after a dangling BEGIN.
