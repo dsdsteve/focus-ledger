@@ -60,8 +60,10 @@ if [ -e "$CLAUDE_MD" ]; then
     printf 'focus-setup: could not create source snapshot for %s\n' "$CLAUDE_MD" >&2
     exit 1
   }
-  if ! rm -f "$source_snapshot" ||
-     ! cp -pP "$CLAUDE_MD" "$source_snapshot" ||
+  # Overwrite the mktemp file in place; do not rm it first. Deleting and
+  # recreating the predictable pathname would reopen a symlink-swap window that
+  # cp -pP could then write CLAUDE.md's bytes through.
+  if ! cp -pP "$CLAUDE_MD" "$source_snapshot" ||
      [ -L "$source_snapshot" ] || [ ! -f "$source_snapshot" ]; then
     cleanup_source
     printf 'focus-setup: refusing unsafe or unstable target %s\n' "$CLAUDE_MD" >&2
@@ -202,6 +204,16 @@ if [ -n "$setup_source" ] && ! cp -p "$setup_source" "$output_tmp"; then
   cleanup_setup
   printf 'focus-setup: could not preserve target mode for %s\n' "$CLAUDE_MD" >&2
   exit 1
+fi
+if [ -z "$setup_source" ]; then
+  # Fresh target: mktemp forced 0600 and the publishing mv preserves the stage's
+  # mode, so match the umask-based mode a plain create would have produced. A
+  # hardcoded 644 would ignore a restrictive umask, so derive 0666 & ~umask.
+  if ! chmod "$(printf '%o' "$(( 0666 & ~0$(umask) ))")" "$output_tmp"; then
+    cleanup_setup
+    printf 'focus-setup: could not set staged output mode for %s\n' "$CLAUDE_MD" >&2
+    exit 1
+  fi
 fi
 
 # Build the complete canonical output in a same-directory stage before touching

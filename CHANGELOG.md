@@ -22,6 +22,10 @@ All notable changes to focus-ledger are documented here. Format follows
 - Park into an empty existing ledger writes the full skeleton so the item lands
   inside Parked. It previously appended a section-less line that list and tidy
   could not see.
+- Fresh setup installs publish `CLAUDE.md` at the umask-based mode a plain create
+  produces instead of `mktemp`'s 0600, keeping a shared project file group- and
+  other-readable. The no-follow source snapshot overwrites its staging file in
+  place rather than deleting and recreating it, which closes a symlink-swap window.
 
 ## [1.2.0] — 2026-08-25
 
