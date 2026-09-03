@@ -489,7 +489,6 @@ restore_inflight_quarantine() {
     else
       # Failed restoration must preserve every remaining source, especially a
       # .restore file when the quarantine itself has disappeared.
-      [ -n "$inflight_source" ] || inflight_status=1
       inflight_status=1
       remember_retained_artifact "$inflight_quarantine"
       remember_retained_artifact "$inflight_copy"

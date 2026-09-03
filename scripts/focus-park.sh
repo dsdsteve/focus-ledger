@@ -41,7 +41,17 @@ _append_park() {
   append_rc=0
   append_created=0
   if focus_ledger_path_status; then
-    :
+    # An empty existing ledger has no Parked/Session structure to append into.
+    # Seed the full skeleton (no user bytes to lose) so the item lands inside
+    # Parked and stays listable/rehomable, matching the missing-ledger path.
+    if [ ! -s "$FOCUS_LEDGER" ]; then
+      if printf '# Focus ledger\n\n%s\n%s\n\n%s\n' \
+        "$FOCUS_PARKED_HEAD" "$item" "$FOCUS_SESSION_HEAD" > "$FOCUS_LEDGER"; then
+        append_created=1
+      else
+        append_rc=1
+      fi
+    fi
   else
     append_path_rc=$?
     case $append_path_rc in

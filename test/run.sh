@@ -96,6 +96,13 @@ run_session_start_exact_checks() {
   env -i HOME="$session_home" PATH="$PATH" "$sh_bin" "$ROOT/hooks/focus-session-start.sh" > "$session_home/out" 2> "$session_home/err"; session_rc=$?
   record_exact_file_case "$sh_bin" "session-start: count comes from extraction pass" "$session_rc" "$session_home/out" "$session_expected" "$session_home/err"
 
+  # Regression: a parked line carrying a raw control byte is neutralized on the
+  # session-start path exactly like the stale/list paths (was emitted verbatim).
+  printf '# Focus ledger\n\n## Parked\n- [ ] (2020-01-01) alpha\001beta\n\n## This session\n' > "$session_ledger"
+  write_session_expected "$session_expected" "$session_ledger" 1 '- [ ] (2020-01-01) alpha?beta'
+  env -i HOME="$session_home" PATH="$PATH" "$sh_bin" "$ROOT/hooks/focus-session-start.sh" > "$session_home/out" 2> "$session_home/err"; session_rc=$?
+  record_exact_file_case "$sh_bin" "session-start: control byte in parked line is neutralized" "$session_rc" "$session_home/out" "$session_expected" "$session_home/err"
+
   rm -rf "$session_home"
 }
 
@@ -460,6 +467,17 @@ run_park_check() {
     pass=$((pass+1)); printf '  ok   [%s] park: reaps stale lock and proceeds\n' "$sh_bin"
   else fail=$((fail+1)); printf '  FAIL [%s] park: stale lock not reaped\n' "$sh_bin"; fi
 
+  # Regression: parking into an empty-but-existing ledger seeds the full skeleton
+  # so the item lands INSIDE Parked, not orphaned section-less at EOF.
+  empty_home=$(mktemp -d); mkdir -p "$empty_home/.claude"; : > "$empty_home/.claude/focus-ledger.md"
+  env -i HOME="$empty_home" PATH="$PATH" "$sh_bin" "$ROOT/scripts/focus-park.sh" "seed on empty" >/dev/null 2>&1; rc=$?
+  if [ "$rc" = 0 ] && grep -qF '## Parked' "$empty_home/.claude/focus-ledger.md" \
+     && grep -qF '## This session' "$empty_home/.claude/focus-ledger.md" \
+     && awk '/^## This session/{exit} /seed on empty/{found=1} END{exit !found}' "$empty_home/.claude/focus-ledger.md"; then
+    pass=$((pass+1)); printf '  ok   [%s] park: empty ledger seeds skeleton, item inside Parked\n' "$sh_bin"
+  else fail=$((fail+1)); printf '  FAIL [%s] park: empty ledger not seeded (rc=%s)\n' "$sh_bin" "$rc"; fi
+  rm -rf "$empty_home"
+
   # Regression (story 1.1): a lock held past every wait window while two parks race.
   # Both time out together, reap, and must serialize — afterwards both new items AND
   # the pre-existing one are present, both parks exit 0, at least one raced item sits
@@ -796,6 +814,134 @@ two
   report_case "$sh_bin" "setup: missing --remove target creates nothing" "$setup_ok" "$setup_why"
   rm -rf "$mhome"
 
+  # Setup must not read, back up, or rewrite through a CLAUDE.md symlink.
+  shome=$(mktemp -d); sreal="$shome/real-rules.md"; smd="$shome/CLAUDE.md"
+  printf '# Symlink target\n\nkeep these bytes\n' > "$sreal"
+  chmod 640 "$sreal"; touch -t 200001010000 "$sreal"; ln -s "$sreal" "$smd"
+  ssum=$(cksum < "$sreal"); smode=$(test_mode_octal "$sreal"); smtime=$(test_mtime_epoch "$sreal")
+  ( cd "$shome" && env -i HOME="$shome" PATH="$PATH" "$sh_bin" \
+    "$ROOT/scripts/focus-setup.sh" local > "$shome/install.out" 2> "$shome/install.err" ); sinstall_rc=$?
+  ( cd "$shome" && env -i HOME="$shome" PATH="$PATH" "$sh_bin" \
+    "$ROOT/scripts/focus-setup.sh" local --remove > "$shome/remove.out" 2> "$shome/remove.err" ); sremove_rc=$?
+  setup_ok=1; setup_why=""
+  [ "$sinstall_rc" = 3 ] && [ "$sremove_rc" = 3 ] && [ -L "$smd" ] &&
+    [ "$(cksum < "$sreal")" = "$ssum" ] &&
+    [ "$(test_mode_octal "$sreal")" = "$smode" ] &&
+    [ "$(test_mtime_epoch "$sreal")" = "$smtime" ] &&
+    [ "$(ls "$smd".focus-bak.* 2>/dev/null | wc -l | tr -d ' ')" = 0 ] &&
+    grep -qF 'refusing symlink target' "$shome/install.err" &&
+    grep -qF 'refusing symlink target' "$shome/remove.err" || {
+      setup_ok=0; setup_why="symlink target was followed or changed (rcs=$sinstall_rc/$sremove_rc)"
+    }
+  report_case "$sh_bin" "setup: symlink target is refused unchanged for install/remove" \
+    "$setup_ok" "$setup_why"
+  rm -rf "$shome"
+
+  # A target swapped to a symlink after the initial guard must not redirect any
+  # backup or publication write. The private source snapshot remains stable and
+  # final publication never opens the symlink target.
+  rhome=$(mktemp -d); rstub=$(mktemp -d); rmd="$rhome/CLAUDE.md"
+  rsensitive="$rhome/sensitive.md"; roriginal="$rhome/CLAUDE.original"
+  printf '# Original rules\n\nkeep original\n' > "$rmd"
+  printf 'sensitive bytes\n' > "$rsensitive"
+  rsum=$(cksum < "$rmd"); rsensitive_sum=$(cksum < "$rsensitive")
+  cat > "$rstub/awk" <<'SETUP_SWAP_AWK'
+#!/bin/sh
+if [ ! -e "$FOCUS_SWAP_ONCE" ]; then
+  : > "$FOCUS_SWAP_ONCE"
+  mv "$FOCUS_SWAP_TARGET" "$FOCUS_SWAP_ORIGINAL" || exit 1
+  ln -s "$FOCUS_SWAP_SENSITIVE" "$FOCUS_SWAP_TARGET" || exit 1
+fi
+exec "$FOCUS_REAL_AWK" "$@"
+SETUP_SWAP_AWK
+  chmod +x "$rstub/awk"
+  ( cd "$rhome" && env -i HOME="$rhome" PATH="$rstub:$PATH" \
+    FOCUS_REAL_AWK="$(command -v awk)" FOCUS_SWAP_ONCE="$rhome/swap.once" \
+    FOCUS_SWAP_TARGET="$rmd" FOCUS_SWAP_ORIGINAL="$roriginal" \
+    FOCUS_SWAP_SENSITIVE="$rsensitive" "$sh_bin" "$ROOT/scripts/focus-setup.sh" local \
+    > "$rhome/out" 2> "$rhome/err" ); rrc=$?
+  rartifacts=0
+  for rpath in "$rmd".focus-bak.* "$rmd".focus-source.* "$rmd".focus-stage.*; do
+    [ ! -e "$rpath" ] && [ ! -L "$rpath" ] || rartifacts=1
+  done
+  setup_ok=1; setup_why=""
+  [ "$rrc" = 1 ] && [ -L "$rmd" ] && [ -f "$roriginal" ] &&
+    [ "$(cksum < "$roriginal")" = "$rsum" ] &&
+    [ "$(cksum < "$rsensitive")" = "$rsensitive_sum" ] &&
+    grep -qF 'target changed or became unsafe' "$rhome/err" &&
+    [ "$rartifacts" = 0 ] || {
+      setup_ok=0; setup_why="post-check symlink swap redirected write or left artifacts (rc=$rrc artifacts=$rartifacts)"
+    }
+  report_case "$sh_bin" "setup: post-check symlink swap cannot redirect publication" \
+    "$setup_ok" "$setup_why"
+  rm -rf "$rhome" "$rstub"
+
+  # TERM after the no-follow source copy completes must remove the snapshot.
+  thome=$(mktemp -d); tstub=$(mktemp -d); tmd="$thome/CLAUDE.md"
+  printf '# Signal rules\n\nkeep signal bytes\n' > "$tmd"; tsum=$(cksum < "$tmd")
+  cat > "$tstub/cp" <<'SETUP_SIGNAL_CP'
+#!/bin/sh
+"$FOCUS_REAL_CP" "$@" || exit $?
+for setup_cp_last do :; done
+case $setup_cp_last in
+  *.focus-source.*)
+    if [ ! -e "$FOCUS_SIGNAL_ONCE" ]; then
+      : > "$FOCUS_SIGNAL_ONCE"
+      kill -TERM "$PPID"
+    fi
+    ;;
+esac
+SETUP_SIGNAL_CP
+  chmod +x "$tstub/cp"
+  ( cd "$thome" && env -i HOME="$thome" PATH="$tstub:$PATH" \
+    FOCUS_REAL_CP="$(command -v cp)" FOCUS_SIGNAL_ONCE="$thome/signal.once" \
+    "$sh_bin" "$ROOT/scripts/focus-setup.sh" local > "$thome/out" 2> "$thome/err" ); trc=$?
+  set -- "$tmd".focus-source.*
+  setup_ok=1; setup_why=""
+  [ "$trc" = 1 ] && [ -e "$thome/signal.once" ] &&
+    [ "$(cksum < "$tmd")" = "$tsum" ] && [ ! -e "$1" ] || {
+      setup_ok=0; setup_why="TERM during source capture retained state or changed target (rc=$trc)"
+    }
+  report_case "$sh_bin" "setup: TERM during source capture removes private snapshot" \
+    "$setup_ok" "$setup_why"
+  rm -rf "$thome" "$tstub"
+
+  # A symlink-to-directory swap in the final mv window must replace the symlink
+  # itself, never move the stage into the redirected directory.
+  phome=$(mktemp -d); phome=$(CDPATH='' cd "$phome" && pwd -P)
+  pstub=$(mktemp -d); pmd="$phome/CLAUDE.md"
+  poriginal="$phome/CLAUDE.concurrent"; predirect="$phome/redirected"
+  printf '# Publish rules\n\nkeep publish bytes\n' > "$pmd"
+  cat > "$pstub/mv" <<'SETUP_PUBLISH_MV'
+#!/bin/sh
+for setup_mv_last do :; done
+if [ "$setup_mv_last" = "$FOCUS_PUBLISH_TARGET" ] && [ ! -e "$FOCUS_PUBLISH_ONCE" ]; then
+  : > "$FOCUS_PUBLISH_ONCE"
+  "$FOCUS_REAL_MV" "$FOCUS_PUBLISH_TARGET" "$FOCUS_PUBLISH_ORIGINAL" || exit $?
+  mkdir "$FOCUS_PUBLISH_REDIRECT" || exit $?
+  ln -s "$FOCUS_PUBLISH_REDIRECT" "$FOCUS_PUBLISH_TARGET" || exit $?
+fi
+exec "$FOCUS_REAL_MV" "$@"
+SETUP_PUBLISH_MV
+  chmod +x "$pstub/mv"
+  ( cd "$phome" && env -i HOME="$phome" PATH="$pstub:$PATH" \
+    FOCUS_REAL_MV="$(command -v mv)" FOCUS_PUBLISH_TARGET="$pmd" \
+    FOCUS_PUBLISH_ORIGINAL="$poriginal" FOCUS_PUBLISH_REDIRECT="$predirect" \
+    FOCUS_PUBLISH_ONCE="$phome/publish.once" "$sh_bin" \
+    "$ROOT/scripts/focus-setup.sh" local > "$phome/out" 2> "$phome/err" ); prc=$?
+  set -- "$predirect"/*; predirect_entry=$1
+  set -- "$pmd".focus-stage.*; pstage=$1
+  setup_ok=1; setup_why=""
+  [ "$prc" = 0 ] && [ -e "$phome/publish.once" ] && [ -f "$pmd" ] &&
+    [ ! -L "$pmd" ] && [ -f "$poriginal" ] &&
+    grep -qF 'FOCUS-LEDGER:BEGIN' "$pmd" && [ ! -e "$predirect_entry" ] &&
+    [ ! -L "$predirect_entry" ] && [ ! -e "$pstage" ] && [ ! -L "$pstage" ] || {
+      setup_ok=0; setup_why="final symlink-directory swap redirected stage or hid failure (rc=$prc)"
+    }
+  report_case "$sh_bin" "setup: final symlink-directory swap cannot redirect stage" \
+    "$setup_ok" "$setup_why"
+  rm -rf "$phome" "$pstub"
+
   # Removing from an existing marker-free target is also a strict no-op: no
   # byte, mode, mtime, or recovery-generation churn.
   nhome=$(mktemp -d); nmd="$nhome/CLAUDE.md"
@@ -860,8 +1006,17 @@ CANONICAL_SETUP
   printf '\nnew user line\n' >> "$fmd"; touch -t 200001010000 "$fmd"
   fsum=$(cksum < "$fmd"); fmtime=$(test_mtime_epoch "$fmd")
   set -- "$fmd".focus-bak.*; fbackup=$1; fbackup_sum=$(cksum < "$fbackup")
-  printf '#!/bin/sh\nexit 1\n' > "$fstub/cp"; chmod +x "$fstub/cp"
-  ( cd "$fhome" && env -i HOME="$fhome" PATH="$fstub:$PATH" "$sh_bin" \
+  cat > "$fstub/cp" <<'SETUP_BACKUP_CP'
+#!/bin/sh
+for setup_cp_last do :; done
+case $setup_cp_last in
+  *.focus-bak.*) exit 1 ;;
+esac
+exec "$FOCUS_REAL_CP" "$@"
+SETUP_BACKUP_CP
+  chmod +x "$fstub/cp"
+  ( cd "$fhome" && env -i HOME="$fhome" PATH="$fstub:$PATH" \
+    FOCUS_REAL_CP="$(command -v cp)" "$sh_bin" \
     "$ROOT/scripts/focus-setup.sh" local > "$fhome/fail.out" 2> "$fhome/fail.err" ); frc=$?
   setup_ok=1; setup_why=""
   set -- "$fmd".focus-bak.*
@@ -1981,6 +2136,29 @@ DOCTOR_NESTED
   report_case "$sh_bin" "doctor: local/global unmatched, nested, and unclosed markers" "$doctor_ok" "$doctor_why"
 
   rm -f "$doctor_work/CLAUDE.md" "$doctor_home/.claude/CLAUDE.md"
+
+  # Regression: doctor must flag same-line BEGIN/END markers (setup already
+  # refuses them); markers mode previously counted it as a clean block.
+  cat > "$doctor_work/CLAUDE.md" <<'DOCTOR_SAMELINE'
+intro
+<!-- FOCUS-LEDGER:BEGIN --> body FOCUS-LEDGER:END -->
+tail
+DOCTOR_SAMELINE
+  touch -t 200001010000 "$doctor_work/CLAUDE.md"
+  doctor_sameline_sum=$(cksum < "$doctor_work/CLAUDE.md"); doctor_sameline_mtime=$(test_mtime_epoch "$doctor_work/CLAUDE.md")
+  (cd "$doctor_work" && env -i HOME="$doctor_home" PATH="$doctor_path" "$sh_bin" \
+    "$ROOT/scripts/focus-doctor.sh" > "$doctor_home/sameline.out" 2> "$doctor_home/sameline.err"); doctor_rc=$?
+  doctor_ok=1; doctor_why=""
+  [ "$doctor_rc" = 1 ] && grep -qF $'marker-same-line\t' "$doctor_home/sameline.out" || {
+    doctor_ok=0; doctor_why="same-line marker not flagged (rc=$doctor_rc)"
+  }
+  [ "$(cksum < "$doctor_work/CLAUDE.md")" = "$doctor_sameline_sum" ] &&
+    [ "$(test_mtime_epoch "$doctor_work/CLAUDE.md")" = "$doctor_sameline_mtime" ] || {
+      doctor_ok=0; doctor_why="$doctor_why; doctor changed CLAUDE.md bytes or mtime"
+    }
+  report_case "$sh_bin" "doctor: same-line BEGIN/END markers are flagged" "$doctor_ok" "$doctor_why"
+  rm -f "$doctor_work/CLAUDE.md"
+
   mkdir "$doctor_ledger.lock" "$doctor_ledger.lock.reap"
   printf 'lock.%s\n' "$$" > "$doctor_ledger.lock/owner"
   printf 'reap.999999999\n' > "$doctor_ledger.lock.reap/owner"

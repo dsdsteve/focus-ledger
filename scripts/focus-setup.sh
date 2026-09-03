@@ -38,11 +38,43 @@ if [ "$remove" = 1 ] && [ ! -e "$CLAUDE_MD" ] && [ ! -L "$CLAUDE_MD" ]; then
   exit 0
 fi
 
+# Setup never follows a CLAUDE.md symlink. Doctor reports the same topology as
+# unsafe; refuse before scanning, backing up, or rewriting through the link.
+if [ -L "$CLAUDE_MD" ]; then
+  printf 'focus-setup: refusing symlink target %s; replace it with a regular file before retrying.\n' \
+    "$CLAUDE_MD" >&2
+  exit 3
+fi
+
+# Capture an existing regular target without following a symlink. All parsing,
+# stripping, and backup reads use this private copy; final publication replaces
+# the target pathname atomically instead of opening it for redirection.
+source_snapshot=
+setup_source=
+cleanup_source() {
+  [ -z "$source_snapshot" ] || rm -f "$source_snapshot" 2>/dev/null || true
+}
+trap 'cleanup_source; exit 1' INT TERM HUP
+if [ -e "$CLAUDE_MD" ]; then
+  source_snapshot=$(mktemp "$CLAUDE_MD.focus-source.XXXXXX") || {
+    printf 'focus-setup: could not create source snapshot for %s\n' "$CLAUDE_MD" >&2
+    exit 1
+  }
+  if ! rm -f "$source_snapshot" ||
+     ! cp -pP "$CLAUDE_MD" "$source_snapshot" ||
+     [ -L "$source_snapshot" ] || [ ! -f "$source_snapshot" ]; then
+    cleanup_source
+    printf 'focus-setup: refusing unsafe or unstable target %s\n' "$CLAUDE_MD" >&2
+    exit 3
+  fi
+  setup_source=$source_snapshot
+fi
+
 # Scan existing bytes before mkdir, touch, backup rotation, or any rewrite.
 # Besides ordinary imbalance, reject same-line markers and multiple sequential
 # blocks because neither has one unambiguous canonical replacement range.
 managed_blocks=0
-if [ -e "$CLAUDE_MD" ] || [ -L "$CLAUDE_MD" ]; then
+if [ -n "$setup_source" ]; then
   scan_result=$(awk '
     {
       has_begin = index($0, "<!-- FOCUS-LEDGER:BEGIN")
@@ -75,7 +107,9 @@ if [ -e "$CLAUDE_MD" ] || [ -L "$CLAUDE_MD" ]; then
         printf "blocks:%d", blocks+0
       }
     }
-  ' "$CLAUDE_MD") || {
+  ' "$setup_source") || {
+    cleanup_source
+    trap - INT TERM HUP
     printf 'focus-setup: marker scan failed for %s; refusing to continue.\n' "$CLAUDE_MD" >&2
     exit 3
   }
@@ -84,6 +118,8 @@ if [ -e "$CLAUDE_MD" ] || [ -L "$CLAUDE_MD" ]; then
     blocks:1) managed_blocks=1; mangled= ;;
     error:*) mangled=${scan_result#error:} ;;
     *)
+      cleanup_source
+      trap - INT TERM HUP
       printf 'focus-setup: marker scan failed for %s; refusing to continue.\n' "$CLAUDE_MD" >&2
       exit 3
       ;;
@@ -101,6 +137,8 @@ if [ -n "$mangled" ]; then
       printf '  Nothing was written. To recover: hand-delete the partial FOCUS-LEDGER block, then re-run.\n'
     fi
   } >&2
+  cleanup_source
+  trap - INT TERM HUP
   exit 3
 fi
 
@@ -109,27 +147,29 @@ fi
 if [ "$remove" = 1 ] && [ "$managed_blocks" = 0 ]; then
   echo "focus-ledger: pivot-park block removed from $CLAUDE_MD"
   echo "  backup: $CLAUDE_MD.focus-bak.* · undo: focus-setup.sh $scope --remove"
+  cleanup_source
+  trap - INT TERM HUP
   exit 0
 fi
 
 strip_tmp=$(mktemp) || {
+  cleanup_source
+  trap - INT TERM HUP
   printf 'focus-setup: could not create rewrite staging file\n' >&2
   exit 1
 }
-output_tmp=$(mktemp) || {
-  rm -f "$strip_tmp"
-  printf 'focus-setup: could not create output staging file\n' >&2
-  exit 1
-}
+output_tmp=
 backup_new=
 cleanup_setup() {
   rm -f "$strip_tmp" "$output_tmp" 2>/dev/null || true
+  cleanup_source
   [ -z "$backup_new" ] || rm -f "$backup_new" 2>/dev/null || true
 }
 trap 'cleanup_setup; exit 1' INT TERM HUP
 
-# Strip the one validated managed block, then drop trailing blank lines.
-if [ -e "$CLAUDE_MD" ] || [ -L "$CLAUDE_MD" ]; then
+# Strip the one validated managed block from the private source snapshot, then
+# drop trailing blank lines.
+if [ -n "$setup_source" ]; then
   if ! awk '
     /<!-- FOCUS-LEDGER:BEGIN/ { skip=1 }
     skip==0 { buf[n++]=$0 }
@@ -139,7 +179,7 @@ if [ -e "$CLAUDE_MD" ] || [ -L "$CLAUDE_MD" ]; then
       for (i=0; i<n; i++) if (buf[i] ~ /[^[:space:]]/) last=i
       for (i=0; i<=last; i++) print buf[i]
     }
-  ' "$CLAUDE_MD" > "$strip_tmp"; then
+  ' "$setup_source" > "$strip_tmp"; then
     cleanup_setup
     printf 'focus-setup: could not prepare rewrite for %s\n' "$CLAUDE_MD" >&2
     exit 1
@@ -148,7 +188,24 @@ else
   : > "$strip_tmp"
 fi
 
-# Build the complete canonical output before touching the target or its backups.
+mkdir -p "$(dirname "$CLAUDE_MD")" || {
+  cleanup_setup
+  printf 'focus-setup: could not create target directory for %s\n' "$CLAUDE_MD" >&2
+  exit 1
+}
+output_tmp=$(mktemp "$CLAUDE_MD.focus-stage.XXXXXX") || {
+  cleanup_setup
+  printf 'focus-setup: could not create same-directory output stage for %s\n' "$CLAUDE_MD" >&2
+  exit 1
+}
+if [ -n "$setup_source" ] && ! cp -p "$setup_source" "$output_tmp"; then
+  cleanup_setup
+  printf 'focus-setup: could not preserve target mode for %s\n' "$CLAUDE_MD" >&2
+  exit 1
+fi
+
+# Build the complete canonical output in a same-directory stage before touching
+# the target or its backups.
 {
   if [ -s "$strip_tmp" ]; then cat "$strip_tmp"; [ "$remove" = 1 ] || printf '\n'; fi
   if [ "$remove" = 0 ]; then
@@ -165,15 +222,15 @@ BLOCK
   fi
 } > "$output_tmp"
 
-mkdir -p "$(dirname "$CLAUDE_MD")" || {
-  cleanup_setup
-  printf 'focus-setup: could not create target directory for %s\n' "$CLAUDE_MD" >&2
-  exit 1
-}
-
 # Publish and verify a new recovery copy before deleting any older generation.
 # A failed or partial copy leaves both the target and every prior backup intact.
-if [ -e "$CLAUDE_MD" ] || [ -L "$CLAUDE_MD" ]; then
+if [ -n "$setup_source" ]; then
+  if [ -L "$CLAUDE_MD" ] || [ ! -f "$CLAUDE_MD" ] ||
+     ! cmp -s "$CLAUDE_MD" "$setup_source"; then
+    cleanup_setup
+    printf 'focus-setup: target changed or became unsafe before backup for %s\n' "$CLAUDE_MD" >&2
+    exit 1
+  fi
   backup_epoch=$(date +%s 2>/dev/null) || {
     cleanup_setup
     printf 'focus-setup: could not create recovery backup timestamp for %s\n' "$CLAUDE_MD" >&2
@@ -191,9 +248,15 @@ if [ -e "$CLAUDE_MD" ] || [ -L "$CLAUDE_MD" ]; then
     printf 'focus-setup: could not create recovery backup for %s\n' "$CLAUDE_MD" >&2
     exit 1
   }
-  if ! cp "$CLAUDE_MD" "$backup_new" || ! cmp -s "$CLAUDE_MD" "$backup_new"; then
+  if ! cp "$setup_source" "$backup_new" || ! cmp -s "$setup_source" "$backup_new"; then
     cleanup_setup
     printf 'focus-setup: could not verify recovery backup for %s\n' "$CLAUDE_MD" >&2
+    exit 1
+  fi
+  if [ -L "$CLAUDE_MD" ] || [ ! -f "$CLAUDE_MD" ] ||
+     ! cmp -s "$CLAUDE_MD" "$setup_source"; then
+    cleanup_setup
+    printf 'focus-setup: target changed or became unsafe before publication for %s\n' "$CLAUDE_MD" >&2
     exit 1
   fi
   for old_backup in "$CLAUDE_MD".focus-bak.*; do
@@ -209,11 +272,20 @@ if [ -e "$CLAUDE_MD" ] || [ -L "$CLAUDE_MD" ]; then
   backup_new=
 fi
 
-if ! cat "$output_tmp" > "$CLAUDE_MD"; then
+focus_setup_publish() {
+  if mv --version >/dev/null 2>&1; then
+    mv -fT "$1" "$2"
+  else
+    mv -fh "$1" "$2"
+  fi
+}
+
+if ! focus_setup_publish "$output_tmp" "$CLAUDE_MD"; then
   cleanup_setup
-  printf 'focus-setup: could not rewrite %s\n' "$CLAUDE_MD" >&2
+  printf 'focus-setup: could not atomically rewrite %s\n' "$CLAUDE_MD" >&2
   exit 1
 fi
+output_tmp=
 backup_new=
 cleanup_setup
 trap - INT TERM HUP

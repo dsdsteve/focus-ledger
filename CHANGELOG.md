@@ -9,9 +9,19 @@ All notable changes to focus-ledger are documented here. Format follows
 ### Fixed
 - Setup removal against an existing marker-free `CLAUDE.md` is now a true
   no-op: target bytes and metadata plus existing recovery backups remain
-  unchanged.
+  unchanged. Setup also refuses symlinked targets before reading, backing up,
+  or rewriting through them.
 - Tidy archive-stage read failures now return through owned cleanup instead of
   exiting around lock release and transient-backup removal.
+- SessionStart neutralizes ASCII control bytes in a parked line before printing
+  it, matching the stale and list output paths, so a hand-edited ledger cannot
+  emit raw control sequences into the session context.
+- Doctor now flags a same-line `<!-- FOCUS-LEDGER:BEGIN --> ... FOCUS-LEDGER:END -->`
+  marker as an error, matching setup's refusal of that structure. The two tools
+  no longer disagree about whether a same-line block is valid.
+- Park into an empty existing ledger writes the full skeleton so the item lands
+  inside Parked. It previously appended a section-less line that list and tidy
+  could not see.
 
 ## [1.2.0] — 2026-08-25
 

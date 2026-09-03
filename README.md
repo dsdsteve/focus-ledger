@@ -2,7 +2,7 @@
 
 A cross-session task ledger for Claude Code, with soft nudges. Park open threads that survive restarts, have them replayed when you open a session, and get a quiet flag when one goes stale. The tool holds the state so you don't have to remember to.
 
-**Current release:** `1.2.1`. This patch makes marker-free setup removal a true no-op and ensures tidy archive-stage read failures release owned locks and temporary recovery files. In 1.2.0 the optional pre-write nudge became opt-in: `FOCUS_WRITE_CHECK` must be `on` or `strict`; unset, `off`, and other values are silent.
+**Current release:** `1.2.1`. This patch makes marker-free setup removal a true no-op, refuses symlinked setup targets, and ensures tidy archive-stage read failures release owned locks and temporary recovery files. In 1.2.0 the optional pre-write nudge became opt-in: `FOCUS_WRITE_CHECK` must be `on` or `strict`; unset, `off`, and other values are silent.
 
 ## What it does
 
@@ -138,7 +138,7 @@ Some people want the assistant to offer to park an unfinished thread after a rea
 /focus-ledger:setup remove    # local unless another scope is stated
 ```
 
-Before creating a parent, target, backup, or staging rewrite, setup validates the existing `<!-- FOCUS-LEDGER:BEGIN ... -->` / `<!-- FOCUS-LEDGER:END -->` structure. Unmatched, nested, unclosed, same-line, or multiple balanced blocks refuse with status 3; target existence, bytes, mtime, and existing backups remain unchanged. Recover by restoring the newest `CLAUDE.md.focus-bak.*` if one exists, or hand-delete only the partial managed block, then rerun.
+Before creating a parent, target, backup, or staging rewrite, setup refuses a symlinked `CLAUDE.md` and validates the existing `<!-- FOCUS-LEDGER:BEGIN ... -->` / `<!-- FOCUS-LEDGER:END -->` structure. Symlinked targets plus unmatched, nested, unclosed, same-line, or multiple balanced blocks refuse with status 3; target existence, bytes, mtime, and existing backups remain unchanged. Recover malformed marker state by restoring the newest `CLAUDE.md.focus-bak.*` if one exists, or hand-delete only the partial managed block, then rerun.
 
 On an accepted install, update, or removal of an actually present managed block, setup first creates and byte-verifies a new `<CLAUDE.md>.focus-bak.<epoch>.<suffix>` recovery copy, then rotates older matching generations and rewrites the target. A `--remove` against either a missing target or an existing marker-free target is a true no-op: it preserves target bytes and metadata and every existing backup. A first install has no source file to back up. Re-running updates the one managed block; removal takes it out. The installed instruction offers to park; it never auto-parks.
 
@@ -183,7 +183,7 @@ Tidy and doctor never purge the retained archive or successful tidy ledger backu
 - Ledger rewrites create `focus-ledger.md.tmp.<pid>.XXXXXX` and sometimes a `.trim` companion. Marker publication creates `<marker>.tmp.<pid>`.
 - Tidy creates ledger/archive stages and verification files such as `.tmp.*`, `.verify*`, `.archive-lines.*`, and a transient archive transaction backup. Rollback can create `<target>.rollback.*`.
 - Before deleting an expired marker or eligible stale temp, tidy renames it to `<original>.tidy-delete.<pid>` and creates a `.restore` recovery copy. The quarantine rename commits logical deletion; unlink failures can intentionally retain a named recovery artifact.
-- Setup uses two implementation-selected system temporary files while building the stripped and canonical `CLAUDE.md` output.
+- Setup uses a private no-follow source snapshot and a same-directory output stage while building and publishing canonical `CLAUDE.md` output.
 
 These are normally removed on handled success or failure. A crash, `SIGKILL`, shell abort, or power loss can retain locks, claims, stages, transaction backups, quarantine files, or setup temps. `doctor` reports ledger, archive, snooze, and cooldown lock/reap directories and pending claims; snooze/cooldown marker state; managed-block files; narrowly classified ledger-adjacent artifacts; and common archive-adjacent transaction leftovers. It deliberately excludes successful retained tidy ledger backups and does not inventory arbitrary paths or implementation-selected setup temps. Tidy removes only its narrowly classified safe stale PID-bearing ledger-rewrite temps and expired regular markers. Legacy/manual adjacent files and unknown recovery artifacts require manual review.
 
@@ -192,7 +192,7 @@ These are normally removed on handled success or failure. A crash, `SIGKILL`, sh
 - `doctor` refuses to follow ledger or `CLAUDE.md` symlinks and reports unsafe/nonregular ledger, marker, lock, claim, temp, and archive-artifact paths without changing them. It rejects `HOME` or `PWD` containing tab/newline separators before emitting TSV.
 - Tidy refuses an unsafe ledger, archive, marker, generated backup, or eligible temp before applying; it does not follow those paths. It rejects `HOME` containing tab/newline separators before report or apply.
 - Park, list, match, resume, done, and Stop refuse or stay silent on unsafe ledger paths. Stop classifies snooze/cooldown markers without following symlinks. Snooze and cooldown publication replace an unsafe destination pathname with a private regular file rather than writing through it.
-- SessionStart retains its legacy regular-file test and setup assumes trusted user-owned `CLAUDE.md` topology. Do not point those paths at sensitive files; run `doctor` before maintenance when provenance is uncertain.
+- SessionStart retains its legacy regular-file test. Setup refuses a symlinked `CLAUDE.md` before reading or rewriting it. Do not point SessionStart paths at sensitive files; run `doctor` before maintenance when provenance is uncertain.
 
 ### Recovery limits
 
@@ -200,7 +200,7 @@ These are normally removed on handled success or failure. A crash, `SIGKILL`, sh
 - Tidy publishes archive and ledger separately. There is no cross-file atomic transaction; a crash between renames can leave an archived record in both files. Rollback on handled errors and `INT`/`TERM`/`HUP` is best effort; a second catchable signal is deferred during recovery. Incomplete rollback preserves and names surviving ledger/archive backups and quarantine recovery paths. After quarantine renames commit volatile deletion, later artifact cleanup failure returns `verified-with-artifacts` instead of claiming an impossible restore.
 - Locks identify owners by PID only. PID reuse can make an abandoned lock or temp look active, conservatively blocking cleanup. Tidy never reaps someone else's ledger/archive lock.
 - Park alone has an append-only fallback when guarded locking/publication cannot proceed. It preserves data but can place the new record at end of file outside the intended section; `doctor` reports that state and tidy can re-home a valid open record.
-- Setup has no lock and rewrites by redirection. Concurrent setup/manual edits or an interruption can leave a truncated target; recover from its retained backup.
+- Setup has no lock. It captures an existing regular source without following symlinks and atomically replaces the target pathname from a same-directory stage, but a concurrent regular-file edit after its final comparison can still be replaced; recover from the retained backup.
 
 Runtime requires `bash`, `awk`, and standard POSIX/BSD/GNU macOS/Linux userland used by the scripts: `cat`, `cksum`, `cmp`, `cp`, `date`, `dd`, `dirname`, `grep`, `kill -0`, `ln`, `ls`, `mkdir`, `mktemp`, `mv`, `rm`, `rmdir`, `sed`, `sleep`, `sort`, `stat`, `tail`, `tr`, and `wc`. The implementation handles BSD/GNU `date`, `stat`, and `mktemp` conventions where they differ. `jq` is optional; Stop has a fallback serializer.
 
