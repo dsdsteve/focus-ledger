@@ -489,7 +489,6 @@ restore_inflight_quarantine() {
     else
       # Failed restoration must preserve every remaining source, especially a
       # .restore file when the quarantine itself has disappeared.
-      [ -n "$inflight_source" ] || inflight_status=1
       inflight_status=1
       remember_retained_artifact "$inflight_quarantine"
       remember_retained_artifact "$inflight_copy"
@@ -932,17 +931,18 @@ if [ "$archive_count" -gt 0 ]; then
     fail_locked 'archive candidate count changed during staging'
   archive_stage=$(mktemp "$ARCHIVE.tmp.XXXXXX" 2>/dev/null) ||
     fail_locked 'could not create same-directory archive stage'
-  {
+  (
     if [ "$archive_existed" = 1 ] && [ -s "$archive_backup" ]; then
       cat "$archive_backup" || exit 1
-      if [ -n "$(tail -c 1 "$archive_backup")" ]; then printf '\n'; fi
+      archive_last_byte=$(tail -c 1 "$archive_backup") || exit 1
+      if [ -n "$archive_last_byte" ]; then printf '\n'; fi
       printf '\n'
     else
       printf '# Focus ledger archive\n\n'
     fi
     printf '## Archived by focus-ledger tidy on %s (epoch %s)\n\n' "$calendar_today" "$now_epoch"
     cat "$archive_lines"
-  } > "$archive_stage" || fail_locked 'could not stage archive'
+  ) > "$archive_stage" || fail_locked 'could not stage archive'
   archive_expected=$(mktemp "$ARCHIVE.verify.XXXXXX" 2>/dev/null) ||
     fail_locked 'could not create archive verification snapshot'
   cat "$archive_stage" > "$archive_expected" || fail_locked 'could not snapshot expected archive'

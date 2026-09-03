@@ -315,6 +315,13 @@ function flush_rewrite_blanks(   blank_i) {
 
 {
   if (mode == "markers") {
+    if (index($0, "<!-- FOCUS-LEDGER:BEGIN") && index($0, "FOCUS-LEDGER:END -->")) {
+      emit_record("ERROR", "marker-same-line", marker_path, FNR, \
+        "split the BEGIN and END markers onto separate lines", \
+        "FOCUS-LEDGER BEGIN and END markers appear on the same line")
+      if (marker_depth == 0) marker_block_count++
+      next
+    }
     if (index($0, "<!-- FOCUS-LEDGER:BEGIN")) {
       marker_depth++
       marker_begin_line[marker_depth] = FNR
@@ -541,7 +548,7 @@ function flush_rewrite_blanks(   blank_i) {
 
 mode == "session-start" && legacy_section == "parked" && /^- \[ \]/ {
   session_count++
-  session_items = session_items $0 ORS
+  session_items = session_items display_escape($0) ORS
   next
 }
 

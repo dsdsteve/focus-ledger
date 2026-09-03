@@ -19,8 +19,10 @@ focus_ledger_path_status || exit 0
 now=$(date +%s) || exit 0
 focus_is_safe_epoch "$now" || exit 0
 
-# Both marker acquisitions consume one shared four-second polling budget, below
-# the five-second hook timeout even when each marker is independently contended.
+# Both marker acquisitions share one polling budget (40 counted attempts, ~4s of
+# sleeps) to stay under the five-second hook timeout. Stale-owner snapshotting and
+# subprocess spawns add a small uncounted margin; if the timeout is hit anyway the
+# hook is killed and just skips the soft nudge (fail-open, no state change).
 marker_lock_budget=40
 focus_lock_attempts_used=0
 acquire_marker_lock() {
