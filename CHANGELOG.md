@@ -4,6 +4,46 @@ All notable changes to focus-ledger are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/); this project uses
 [semantic versioning](https://semver.org/).
 
+## [1.2.2] — 2026-09-21
+
+### Fixed
+- Doctor and `tidy --apply` no longer disagree about whether an install is
+  usable. Doctor now reports an unsafe or unreadable archive path, a ledger
+  directory it cannot write, and a missing `cmp`, `sort`, `cksum`, or `mktemp`.
+  Each of those made apply refuse with status 2 after doctor had printed
+  `all-clean` and exited 0, and in two of them apply's own error told the
+  operator to run doctor.
+- A lapsed nudge-cooldown marker no longer counts as a finding. The Stop hook
+  writes `now+FOCUS_NUDGE_COOLDOWN` to `.focus-last-nudge` and never removes
+  it, so every install that had nudged in the past exited 1 and suppressed the
+  `all-clean` line. It reports as `INFO` now. The user-created snooze marker
+  still reports its expiry as a finding.
+- Artifacts focus-ledger itself creates during an interrupted run are reported
+  as `*-interrupted` rather than described as legacy or manual files. One
+  shared predicate now drives all three adjacent-artifact scans, which
+  previously each carried a hand-written exclusion list covering only `.lock`
+  paths and so missed the `.tidy-delete.*` namespace entirely.
+- A pending lock claim written without a trailing newline is no longer reported
+  as unreadable at status 2. POSIX `read` returns nonzero at end of file
+  without a delimiter even though the token is populated, which the sibling
+  lock-owner handler already tolerated.
+- Guarded ledger rewrites preserve the ledger's existing permission bits. Park,
+  resume, done, snooze, and tidy apply staged through `mktemp`, which forces
+  0600, and the publishing `mv` carried that mode onto the ledger, silently
+  retightening a file the user had deliberately widened.
+- Setup refuses a non-regular `CLAUDE.md` by type before reading it. A FIFO or
+  device target is not a symlink, so the existing refusal missed it and the
+  snapshot `cp` blocked on the open indefinitely.
+- Setup serializes concurrent runs on its target with the shared lock the
+  ledger verbs use. Two overlapping runs each took a backup and then each
+  rotation loop deleted the other's, destroying the losing run's only recovery
+  copy of the original. Reusing the shared lock brings stale-lock reaping with
+  it, so a killed setup does not wedge the next run.
+- Tidy's lock-acquisition failure names the real cause. `mkdir` fails for
+  reasons other than contention, and blaming an existing owner for an
+  unwritable directory sent the operator looking for a lock that was never
+  created.
+
 ## [1.2.1] — 2026-08-25
 
 ### Fixed

@@ -3696,10 +3696,10 @@ EOF_README_COMMANDS
     "$ROOT/README.md" | sed -n '1p')
   static_version_ok=1
   static_version_why=""
-  if [ "$static_plugin_version" != 1.2.1 ] ||
-     [ "$static_marketplace_version" != 1.2.1 ] ||
-     [ "$static_changelog_version" != 1.2.1 ] ||
-     [ "$static_readme_version" != 1.2.1 ]; then
+  if [ "$static_plugin_version" != 1.2.2 ] ||
+     [ "$static_marketplace_version" != 1.2.2 ] ||
+     [ "$static_changelog_version" != 1.2.2 ] ||
+     [ "$static_readme_version" != 1.2.2 ]; then
     static_version_ok=0
     static_version_why="plugin=$static_plugin_version marketplace=$static_marketplace_version changelog=$static_changelog_version README=$static_readme_version"
   elif ! grep -qi 'opt-in' "$ROOT/README.md" ||
@@ -3711,7 +3711,7 @@ EOF_README_COMMANDS
     static_version_ok=0
     static_version_why="Epic 1 cherry-pickable 1.1.2 patch note missing from CHANGELOG"
   fi
-  report_case static "release: metadata, README, and CHANGELOG agree on 1.2.1" \
+  report_case static "release: metadata, README, and CHANGELOG agree on 1.2.2" \
     "$static_version_ok" "$static_version_why"
 
   static_exec_ok=1
@@ -3741,12 +3741,12 @@ with open(sys.argv[3], encoding="utf-8") as stream:
     manifest = json.load(stream)
 
 assert plugin["name"] == "focus-ledger"
-assert plugin["version"] == "1.2.1"
+assert plugin["version"] == "1.2.2"
 assert marketplace["name"] == "focus-ledger"
 assert len(marketplace["plugins"]) == 1
 assert marketplace["plugins"][0]["name"] == "focus-ledger"
 assert marketplace["plugins"][0]["source"] == "./"
-assert marketplace["plugins"][0]["version"] == "1.2.1"
+assert marketplace["plugins"][0]["version"] == "1.2.2"
 
 expected = {
     "SessionStart": ("startup|resume|clear|compact", "${CLAUDE_PLUGIN_ROOT}/hooks/focus-session-start.sh", 5),

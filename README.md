@@ -2,7 +2,7 @@
 
 A cross-session task ledger for Claude Code, with soft nudges. Park open threads that survive restarts, have them replayed when you open a session, and get a quiet flag when one goes stale. The tool holds the state so you don't have to remember to.
 
-**Current release:** `1.2.1`. This patch makes marker-free setup removal a true no-op, refuses symlinked setup targets, and ensures tidy archive-stage read failures release owned locks and temporary recovery files. In 1.2.0 the optional pre-write nudge became opt-in: `FOCUS_WRITE_CHECK` must be `on` or `strict`; unset, `off`, and other values are silent.
+**Current release:** `1.2.2`. This patch makes `doctor` report the preconditions `tidy --apply` enforces so a clean report means apply can run, preserves the ledger's permission bits across guarded rewrites, refuses a non-regular setup target instead of hanging on it, and serializes concurrent setup runs with a lock so neither run deletes the other's recovery backup. In 1.2.0 the optional pre-write nudge became opt-in: `FOCUS_WRITE_CHECK` must be `on` or `strict`; unset, `off`, and other values are silent.
 
 ## What it does
 
@@ -57,7 +57,7 @@ For deterministic listing, matching, completion, and cleanup:
 - `focus`, matching, Stop, and tidy skip malformed or near-miss records rather than guessing. `doctor` reports the exact line and hand-fix without changing it. Tidy also reports malformed lines as `SKIP` and leaves them byte-for-byte unchanged.
 - SessionStart retains a legacy, more permissive replay rule for column-one open lines under a heading beginning `## Parked`; run `doctor` if SessionStart shows something that `focus` omits.
 
-This is **format v1**. Release 1.2.1 does not change it.
+This is **format v1**. Release 1.2.2 does not change it.
 
 ### Ranking and selection
 
