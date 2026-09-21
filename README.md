@@ -11,7 +11,7 @@ A cross-session task ledger for Claude Code, with soft nudges. Park open threads
 - **`/focus-ledger:resume <query>`** — move one uniquely matched parked thread into this session.
 - **`/focus-ledger:done <query>`** — mark one uniquely matched parked or in-session thread complete.
 - **`/focus-ledger:snooze [1d|4h|30m]`** — mute the stale-thread nudge temporarily; the default is one day.
-- **`/focus-ledger:doctor`** — diagnose ledger, marker, setup-block, lock, and adjacent-artifact problems without changing anything.
+- **`/focus-ledger:doctor`** — diagnose ledger, marker, setup-block, lock, and adjacent-artifact problems without changing anything. It also reports the conditions that would make `tidy --apply` refuse, so a clean report means apply can run: an unsafe or unreadable archive path, a ledger directory it cannot write, and a missing `cmp`, `sort`, `cksum`, or `mktemp`.
 - **`/focus-ledger:tidy`** — report safe cleanup, ask once, then archive and repair only the freshly verified candidate set.
 - **`/focus-ledger:setup [local|global|remove]`** — manage the optional pivot-park instruction in a project or global `CLAUDE.md`.
 
@@ -161,6 +161,7 @@ There are no network calls. Trust is local filesystem access plus what plugin ou
 - SessionStart sends parked lines into model context automatically. Stop can send up to three stale item texts in a `systemMessage`. Command output and candidate/report rows are also read by the model when you invoke a command. Do not put passwords, credentials, private keys, tokens, or other secrets in the ledger.
 - Ledger records are inert, untrusted data. Scripts never evaluate them as shell or awk source. Dynamic parser values travel through the environment, and command prompts relay escaped TSV fields rather than executing them.
 - `doctor` is strictly read-only: it does not acquire locks, create scratch files, remove artifacts, or repair text. Tidy report mode is also read-only.
+- A guarded ledger rewrite preserves the ledger's existing permission bits, so park, resume, done, snooze, and tidy apply never silently retighten a file you deliberately widened. A ledger created from scratch gets the mode your umask implies.
 - The command-level gates are user intent for ordinary mutations, exact `yes` for tidy apply, a scope choice for setup when omitted, and optional `strict` permission confirmation for matched writes. Direct script invocation bypasses command-prompt gates.
 
 ### Retained paths
@@ -185,14 +186,14 @@ Tidy and doctor never purge the retained archive or successful tidy ledger backu
 - Before deleting an expired marker or eligible stale temp, tidy renames it to `<original>.tidy-delete.<pid>` and creates a `.restore` recovery copy. The quarantine rename commits logical deletion; unlink failures can intentionally retain a named recovery artifact.
 - Setup uses a private no-follow source snapshot and a same-directory output stage while building and publishing canonical `CLAUDE.md` output.
 
-These are normally removed on handled success or failure. A crash, `SIGKILL`, shell abort, or power loss can retain locks, claims, stages, transaction backups, quarantine files, or setup temps. `doctor` reports ledger, archive, snooze, and cooldown lock/reap directories and pending claims; snooze/cooldown marker state; managed-block files; narrowly classified ledger-adjacent artifacts; and common archive-adjacent transaction leftovers. It deliberately excludes successful retained tidy ledger backups and does not inventory arbitrary paths or implementation-selected setup temps. Tidy removes only its narrowly classified safe stale PID-bearing ledger-rewrite temps and expired regular markers. Legacy/manual adjacent files and unknown recovery artifacts require manual review.
+These are normally removed on handled success or failure. A crash, `SIGKILL`, shell abort, or power loss can retain locks, claims, stages, transaction backups, quarantine files, or setup temps. `doctor` reports ledger, archive, snooze, and cooldown lock/reap directories and pending claims; snooze/cooldown marker state; managed-block files; narrowly classified ledger-adjacent artifacts; and common archive-adjacent transaction leftovers. It deliberately excludes successful retained tidy ledger backups and does not inventory arbitrary paths or implementation-selected setup temps. Tidy removes only its narrowly classified safe stale PID-bearing ledger-rewrite temps and expired regular markers. Artifacts focus-ledger itself created during an interrupted run are reported as `*-interrupted` and name it as the author. A legacy or manual adjacent file, whose provenance cannot be recovered from its name, keeps the `*-leftover` wording. Both require manual review and removal.
 
 ### Unsafe path handling is intentionally narrow
 
-- `doctor` refuses to follow ledger or `CLAUDE.md` symlinks and reports unsafe/nonregular ledger, marker, lock, claim, temp, and archive-artifact paths without changing them. It rejects `HOME` or `PWD` containing tab/newline separators before emitting TSV.
+- `doctor` refuses to follow ledger or `CLAUDE.md` symlinks and reports unsafe/nonregular ledger, marker, lock, claim, temp, archive, and archive-artifact paths without changing them. It rejects `HOME` or `PWD` containing tab/newline separators before emitting TSV.
 - Tidy refuses an unsafe ledger, archive, marker, generated backup, or eligible temp before applying; it does not follow those paths. It rejects `HOME` containing tab/newline separators before report or apply.
 - Park, list, match, resume, done, and Stop refuse or stay silent on unsafe ledger paths. Stop classifies snooze/cooldown markers without following symlinks. Snooze and cooldown publication replace an unsafe destination pathname with a private regular file rather than writing through it.
-- SessionStart retains its legacy regular-file test. Setup refuses a symlinked `CLAUDE.md` before reading or rewriting it. Do not point SessionStart paths at sensitive files; run `doctor` before maintenance when provenance is uncertain.
+- SessionStart retains its legacy regular-file test. Setup refuses a symlinked or non-regular `CLAUDE.md` before reading or rewriting it, so a FIFO or device target exits 3 instead of blocking the snapshot read. Do not point SessionStart paths at sensitive files; run `doctor` before maintenance when provenance is uncertain.
 
 ### Recovery limits
 
