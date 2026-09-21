@@ -46,6 +46,15 @@ if [ -L "$CLAUDE_MD" ]; then
   exit 3
 fi
 
+# A FIFO or device target is not a symlink, so the check above misses it, and
+# the snapshot cp below blocks on the open before its own type check can run.
+# Refuse a non-regular target here instead of hanging.
+if [ -e "$CLAUDE_MD" ] && [ ! -f "$CLAUDE_MD" ]; then
+  printf 'focus-setup: refusing non-regular target %s; replace it with a regular file before retrying.\n' \
+    "$CLAUDE_MD" >&2
+  exit 3
+fi
+
 # Capture an existing regular target without following a symlink. All parsing,
 # stripping, and backup reads use this private copy; final publication replaces
 # the target pathname atomically instead of opening it for redirection.

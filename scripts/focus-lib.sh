@@ -119,6 +119,31 @@ focus_file_mtime_epoch() {
   return 1
 }
 
+# Read a file's permission bits as octal, BSD stat first then GNU, matching the
+# probe order focus_file_mtime_epoch uses. Returns 1 when neither reports a
+# plain octal value, so callers can skip mode work rather than guess.
+focus_file_mode_octal() {
+  focus_mode_path=$1
+  if focus_mode_value=$(stat -f '%Lp' "$focus_mode_path" 2>/dev/null) &&
+     focus_is_octal_mode "$focus_mode_value"; then
+    printf '%s\n' "$focus_mode_value"
+    return 0
+  fi
+  if focus_mode_value=$(stat -c '%a' "$focus_mode_path" 2>/dev/null) &&
+     focus_is_octal_mode "$focus_mode_value"; then
+    printf '%s\n' "$focus_mode_value"
+    return 0
+  fi
+  return 1
+}
+
+focus_is_octal_mode() {
+  case ${1:-} in
+    ''|*[!0-7]*) return 1 ;;
+  esac
+  [ "${#1}" -le 4 ]
+}
+
 # Only the PID-bearing shape emitted by focus_rewrite_begin is eligible. The
 # recorded process must also be gone before tidy treats the path as stale; old
 # six-character or manual .tmp names remain doctor-only because provenance is
@@ -738,6 +763,18 @@ focus_rewrite_begin() {
     FOCUS_PRE_FINAL_NEWLINE=1
   fi
   FOCUS_TMP=$(mktemp "$FOCUS_LEDGER.tmp.$$.XXXXXX" 2>/dev/null) || return 1
+  # mktemp forces 0600 and the publishing mv carries the stage's mode onto the
+  # ledger, so every guarded rewrite silently retightened a looser ledger. This
+  # is the defect a756e2f fixed for CLAUDE.md. The ledger already exists here,
+  # so preserve its current mode instead of deriving one from umask. A new
+  # ledger keeps mktemp's 0600, which is what it already got.
+  if focus_rewrite_mode=$(focus_file_mode_octal "$FOCUS_LEDGER"); then
+    chmod "$focus_rewrite_mode" "$FOCUS_TMP" 2>/dev/null || {
+      rm -f "$FOCUS_TMP" 2>/dev/null || true
+      FOCUS_TMP=
+      return 1
+    }
+  fi
 }
 
 focus_rewrite_discard() {
