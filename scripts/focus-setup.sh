@@ -55,6 +55,32 @@ if [ -e "$CLAUDE_MD" ] && [ ! -f "$CLAUDE_MD" ]; then
   exit 3
 fi
 
+# Serialize concurrent setup runs on this target. Without a lock, two runs each
+# take a backup and then each one's rotation loop below deletes the other's,
+# destroying the losing run's only recovery copy of the original file, which is
+# the copy SECURITY.md tells the user to recover from. Reuse the shared lock the
+# ledger verbs use rather than hand-rolling one; it brings stale-lock reaping
+# with it. The acquire runs inside an if-condition so setup's set -e does not
+# abort on the library's internal non-zero probes, and cleanup_source releases
+# the lock on every exit path (it is the chokepoint cleanup_setup and the traps
+# all funnel through).
+SCRIPT_DIR=$(CDPATH='' cd "$(dirname "$0")" && pwd)
+if [ -n "${CLAUDE_PLUGIN_ROOT:-}" ] && [ -f "${CLAUDE_PLUGIN_ROOT}/scripts/focus-lib.sh" ]; then
+  FOCUS_LIB_DIR="${CLAUDE_PLUGIN_ROOT}/scripts"
+else
+  FOCUS_LIB_DIR=$SCRIPT_DIR
+fi
+if [ ! -f "$FOCUS_LIB_DIR/focus-lib.sh" ]; then
+  printf 'focus-setup: cannot find focus-lib.sh next to focus-setup.sh\n' >&2
+  exit 1
+fi
+. "$FOCUS_LIB_DIR/focus-lib.sh"
+if ! focus_lock_acquire "$CLAUDE_MD"; then
+  focus_lock_release 2>/dev/null || true
+  printf 'focus-setup: another focus-setup run holds the lock on %s; retry shortly.\n' "$CLAUDE_MD" >&2
+  exit 1
+fi
+
 # Capture an existing regular target without following a symlink. All parsing,
 # stripping, and backup reads use this private copy; final publication replaces
 # the target pathname atomically instead of opening it for redirection.
@@ -62,6 +88,9 @@ source_snapshot=
 setup_source=
 cleanup_source() {
   [ -z "$source_snapshot" ] || rm -f "$source_snapshot" 2>/dev/null || true
+  # Release the target lock acquired above. Safe to call more than once and on
+  # paths that never locked: focus_lock_release no-ops when nothing is held.
+  focus_lock_release 2>/dev/null || true
 }
 trap 'cleanup_source; exit 1' INT TERM HUP
 if [ -e "$CLAUDE_MD" ]; then

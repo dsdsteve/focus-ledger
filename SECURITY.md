@@ -73,7 +73,7 @@ Path defenses are operation-specific; there is no general filesystem sandbox:
 - Recovery traps cover `INT`, `TERM`, and `HUP`, not `SIGKILL`, shell/runtime failure, or machine power loss. A second catchable signal is deferred while rollback restores state and releases locks. Rollback is best effort; incomplete recovery preserves and names actual surviving recovery paths.
 - Lock ownership is PID-only. PID reuse can make an abandoned lock or temp look active, conservatively preventing reaping or cleanup until inspected.
 - Park can fall back to one append-only write when cooperative locking/publication cannot proceed. This protects existing bytes but can leave the record outside a required section for doctor/tidy to report or re-home.
-- Setup has no lock. It captures an existing regular source without following symlinks and atomically replaces the target pathname from a same-directory stage, but a concurrent regular-file edit after its final comparison can still be replaced; use the retained backup to recover.
+- Setup serializes concurrent runs on its target with the shared lock the ledger verbs use, so two runs cannot each take a backup and then delete the other's during rotation. It captures an existing regular source without following symlinks and atomically replaces the target pathname from a same-directory stage. A concurrent regular-file edit by something other than setup, landing after its final comparison, can still be replaced; use the retained backup to recover.
 
 The implementation is intentionally small (`hooks/`, `scripts/`, `commands/`) and is worth reviewing before trusting it on your machine.
 
