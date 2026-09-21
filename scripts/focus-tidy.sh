@@ -826,7 +826,18 @@ fi
 # Unlike ordinary mutators, tidy never reaps someone else's stale lock artifacts.
 if ! tidy_ledger_lock_acquire; then
   focus_lock_release
-  printf 'focus-tidy: could not acquire ledger lock without reaping an existing owner\n' >&2
+  # mkdir fails for reasons other than contention. Blaming "an existing owner"
+  # when the directory is simply unwritable sent the operator hunting for a lock
+  # that was never there, and doctor agreed there was none.
+  tidy_ledger_dir=${FOCUS_LEDGER%/*}
+  if [ -d "$tidy_ledger_dir" ] && [ ! -w "$tidy_ledger_dir" ]; then
+    printf 'focus-tidy: ledger directory %s is not writable; no lock could be created\n' \
+      "$tidy_ledger_dir" >&2
+  elif [ -d "$FOCUS_LEDGER.lock" ]; then
+    printf 'focus-tidy: could not acquire ledger lock without reaping an existing owner\n' >&2
+  else
+    printf 'focus-tidy: could not create ledger lock %s\n' "$FOCUS_LEDGER.lock" >&2
+  fi
   exit 2
 fi
 if ! tidy_write_gate_acquire; then
@@ -948,9 +959,9 @@ if [ "$archive_count" -gt 0 ]; then
   cat "$archive_stage" > "$archive_expected" || fail_locked 'could not snapshot expected archive'
 fi
 
-# Once publication can begin, signals use the same two-file rollback path as
-# explicit failures rather than the generic lock cleanup trap from focus-lib.
-trap 'rollback_and_fail "interrupted by signal"' INT TERM HUP
+# The two-file rollback trap is already installed above, before the archive-lock
+# block; publication does not change the handler. Re-installing it here was a
+# no-op whose comment claimed otherwise.
 
 if [ "$archive_count" -gt 0 ]; then
   if [ "$archive_pre_cksum" = missing ]; then

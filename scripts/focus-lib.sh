@@ -142,6 +142,34 @@ focus_is_tidy_temp_path() {
   ! kill -0 "$focus_temp_owner_pid" 2>/dev/null
 }
 
+# Recognize a path this plugin creates itself, relative to one of its own bases
+# (the ledger, the archive, or a marker). Consumers that scan "<base>".* use this
+# to attribute a surviving artifact correctly: it is an interrupted focus-ledger
+# transaction, not something the user left behind. It deliberately does NOT say
+# the artifact is safe to remove automatically — reclaiming is tidy's contract,
+# and the retained backups are intentional per README.
+# ponytail: one predicate both tools call, because three hand-synced denylists
+# are what let .tidy-delete.* and the archive backup fall through in the first
+# place. Add a namespace here, not in each scan.
+focus_is_plugin_artifact() {
+  focus_artifact_path=$1
+  focus_artifact_base=$2
+  case $focus_artifact_path in
+    "$focus_artifact_base".lock|"$focus_artifact_base".lock.reap) return 0 ;;
+    "$focus_artifact_base".lock.claim.*|"$focus_artifact_base".lock.reap.claim.*) return 0 ;;
+    "$focus_artifact_base".backup.*) return 0 ;;
+    "$focus_artifact_base".tidy-delete.*) return 0 ;;
+    # Deliberately NOT .tmp.*: focus_is_tidy_temp_path owns the current
+    # PID-bearing rewrite shape, and a legacy six-character .tmp name stays
+    # provenance-unknown per the contract documented on that function.
+    "$focus_artifact_base".verify|"$focus_artifact_base".verify-*) return 0 ;;
+    "$focus_artifact_base".verify.*) return 0 ;;
+    "$focus_artifact_base".archive-lines.*) return 0 ;;
+    "$focus_artifact_base".rollback.*) return 0 ;;
+  esac
+  return 1
+}
+
 # Convert the local calendar date used by focus-park into the shared civil-day
 # number. Using date +%F rather than epoch/86400 avoids UTC/local midnight drift.
 focus_calendar_days() {

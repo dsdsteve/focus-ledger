@@ -204,7 +204,11 @@ inspect_lock_claims() {
       continue
     fi
     claim_token=
-    if ! IFS= read -r claim_token < "$claim_path"; then
+    # POSIX read returns nonzero at EOF without a final delimiter even though
+    # the token is fully populated, so a claim written without a trailing
+    # newline is readable. Only an empty token is a real read failure. The
+    # sibling handler in inspect_lock_dir already tolerates this.
+    if ! IFS= read -r claim_token < "$claim_path" && [ -z "$claim_token" ]; then
       [ -e "$claim_path" ] || [ -L "$claim_path" ] || continue
       emit ERROR "$claim_code-unreadable" "$claim_path" - \
         'restore read permission and rerun doctor' \
@@ -249,9 +253,21 @@ inspect_epoch_marker() {
   case $marker_state in
     missing|active) ;;
     expired)
+      # A lapsed last-nudge is the normal steady state: the Stop hook writes
+      # now+cooldown and never removes it, so every install that has ever
+      # nudged carries one. Reporting it as a finding made doctor exit 1 and
+      # suppress all-clean on a healthy install. Snooze is user-created, so its
+      # expiry stays a finding worth acting on.
+      # ponytail: INFO, not a suppressed record — the marker is still visible.
+      if [ "$epoch_code" != snooze ]; then
+        emit INFO "$epoch_code-expired" "$epoch_path" - \
+          'no action needed; tidy apply reclaims it during ordinary maintenance' \
+          "internal cooldown marker lapsed at epoch $marker_value (now $now)"
+        return 0
+      fi
       case $ledger_state in
         nonempty)
-          epoch_action='run focus-tidy if its report classifies this marker for removal'
+          epoch_action='run focus-tidy --apply if its report classifies this marker for removal'
           ;;
         missing|empty)
           epoch_action='remove this expired marker manually; tidy is a no-op while the ledger is missing or empty'
@@ -318,9 +334,15 @@ inspect_ledger_artifacts() {
       continue
     fi
     if ! focus_is_tidy_temp_path "$artifact"; then
-      emit WARN temp-leftover "$artifact" - \
-        'inspect this legacy or manual ledger-adjacent file; tidy will not remove it' \
-        'path does not match the PID-bearing rewrite-temp cleanup contract'
+      if focus_is_plugin_artifact "$artifact" "$FOCUS_LEDGER"; then
+        emit WARN temp-interrupted "$artifact" - \
+          'remove this manually once no focus-ledger command is running; tidy does not reclaim it' \
+          'focus-ledger created this during an interrupted run; it is not a user or legacy file'
+      else
+        emit WARN temp-leftover "$artifact" - \
+          'inspect this legacy or manual ledger-adjacent file; tidy will not remove it' \
+          'path does not match the PID-bearing rewrite-temp cleanup contract'
+      fi
       findings=$((findings + 1))
       continue
     fi
@@ -333,7 +355,7 @@ inspect_ledger_artifacts() {
     fi
     if [ "$artifact_mtime" -le $((now - 86400)) ] 2>/dev/null; then
       emit WARN temp-stale "$artifact" - \
-        'run focus-tidy to remove this classified safe stale temp' \
+        'run focus-tidy --apply to remove this classified safe stale temp' \
         "eligible regular temp is at least 86400 seconds old (mtime $artifact_mtime)"
     else
       emit WARN temp-leftover "$artifact" - \
@@ -351,6 +373,10 @@ inspect_archive_artifacts() {
       reject_unsafe_discovered_path
       continue
     fi
+    # No .backup.* exclusion here, unlike the ledger scan: tidy removes the
+    # archive backup on a successful apply and deliberately retains the ledger
+    # one, so a surviving archive backup means an interrupted run and stays
+    # reportable. The asymmetry is the contract, not an oversight.
     case $artifact in
       "$ARCHIVE.lock"|"$ARCHIVE.lock.reap"|\
       "$ARCHIVE.lock.claim."*|"$ARCHIVE.lock.reap.claim."*) continue ;;
@@ -359,6 +385,13 @@ inspect_archive_artifacts() {
       emit ERROR archive-artifact-unsafe "$artifact" - \
         'inspect this path manually; doctor never follows or removes it' \
         'archive-adjacent transaction artifact is a symlink or non-regular path'
+    elif focus_is_plugin_artifact "$artifact" "$ARCHIVE" ||
+         { case $artifact in "$ARCHIVE".tmp.*) : ;; *) false ;; esac; }; then
+      # $ARCHIVE.tmp.* is unambiguously tidy's archive stage — unlike the ledger,
+      # the archive has no legacy .tmp naming whose provenance is unknown.
+      emit WARN archive-artifact-interrupted "$artifact" - \
+        'remove this manually once no focus-ledger command is running; tidy does not reclaim it' \
+        'focus-ledger created this during an interrupted archive transaction'
     else
       emit WARN archive-artifact-leftover "$artifact" - \
         'inspect this archive transaction or recovery artifact manually' \
@@ -385,6 +418,10 @@ inspect_marker_artifacts() {
       emit ERROR "$marker_artifact_code-artifact-unsafe" "$artifact" - \
         'inspect this path manually; doctor never follows or removes it' \
         'marker-adjacent stage or recovery artifact is a symlink or non-regular path'
+    elif focus_is_plugin_artifact "$artifact" "$marker_artifact_target"; then
+      emit WARN "$marker_artifact_code-artifact-interrupted" "$artifact" - \
+        'remove this manually once no focus-ledger command is running; tidy does not reclaim it' \
+        'focus-ledger created this during an interrupted marker cleanup'
     else
       emit WARN "$marker_artifact_code-artifact-leftover" "$artifact" - \
         'inspect this marker stage or recovery artifact manually' \
@@ -397,6 +434,7 @@ inspect_marker_artifacts() {
 emit META doctor "$FOCUS_LEDGER" - 'read-only format-v1 diagnostics' 'output fields: level, code, path, line, action, detail'
 
 if ! command -v awk >/dev/null 2>&1 || ! awk 'BEGIN { exit 0 }' </dev/null >/dev/null 2>&1; then
+  ledger_state=unavailable
   emit ERROR awk-unavailable - - \
     'restore a working awk command and rerun doctor' \
     'ledger, marker, and diagnostic record parsing is unavailable'
@@ -429,6 +467,46 @@ else
     operational=1
   fi
 fi
+
+# Preconditions tidy apply enforces but doctor used to skip, so an all-clean
+# report could precede an exit-2 refusal from --apply. Keep these in step with
+# focus-tidy's own refusals: a symlinked or non-regular archive, a ledger
+# directory it cannot stage temps or a lock dir into, and the external tools its
+# verification depends on.
+# ponytail: [ -w ] is a stat, not a probe write — doctor stays read-only.
+if [ -L "$ARCHIVE" ]; then
+  emit ERROR archive-unsafe "$ARCHIVE" - \
+    'replace the archive symlink with a regular file before running tidy apply' \
+    'tidy refuses a symlinked archive; doctor does not follow one'
+  findings=$((findings + 1))
+elif [ -e "$ARCHIVE" ] && [ ! -f "$ARCHIVE" ]; then
+  emit ERROR archive-unsafe "$ARCHIVE" - \
+    'replace the non-regular archive path before running tidy apply' \
+    'tidy refuses a non-regular archive path'
+  findings=$((findings + 1))
+elif [ -e "$ARCHIVE" ] && [ ! -r "$ARCHIVE" ]; then
+  emit ERROR archive-unreadable "$ARCHIVE" - \
+    'restore read permission on the archive before running tidy apply' \
+    'tidy refuses an unreadable archive path'
+  findings=$((findings + 1))
+fi
+
+ledger_dir=${FOCUS_LEDGER%/*}
+if [ -d "$ledger_dir" ] && [ ! -w "$ledger_dir" ]; then
+  emit ERROR ledger-dir-unwritable "$ledger_dir" - \
+    'restore write permission on the ledger directory before running any write command' \
+    'tidy and park stage same-directory temps and lock dirs here; apply cannot proceed'
+  findings=$((findings + 1))
+fi
+
+for required_tool in cmp sort cksum mktemp; do
+  if ! command -v "$required_tool" >/dev/null 2>&1; then
+    emit ERROR "tool-unavailable-$required_tool" - - \
+      "install or restore $required_tool before running tidy apply" \
+      'tidy apply depends on this tool for record capture and backup verification'
+    findings=$((findings + 1))
+  fi
+done
 
 inspect_managed_markers "$PWD/CLAUDE.md"
 inspect_managed_markers "$HOME/.claude/CLAUDE.md"

@@ -2900,7 +2900,7 @@ run_doctor_review_patch_checks() {
   patch_ok=1; patch_why=""
   [ "$patch_rc" = 1 ] && grep -qF $'archive-lock-active\t' "$patch_home/inventory.out" &&
     grep -qF $'snooze-lock-stale\t' "$patch_home/inventory.out" &&
-    grep -F $'archive-artifact-leftover\t' "$patch_home/inventory.out" | grep -qF "$archive_leftover" &&
+    grep -F $'archive-artifact-interrupted\t' "$patch_home/inventory.out" | grep -qF "$archive_leftover" &&
     [ -d "$patch_archive.lock" ] && [ -d "$patch_home/.claude/.focus-snooze.lock" ] &&
     [ "$(cat "$archive_leftover")" = recovery ] || {
       patch_ok=0; patch_why="archive/marker inventory missing or changed state (rc=$patch_rc)"
