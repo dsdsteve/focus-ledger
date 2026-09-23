@@ -2559,7 +2559,14 @@ if [ "${1:-}" = "$FOCUS_TIDY_PARK_GATE" ]; then
 fi
 exec "$FOCUS_REAL_MKDIR" "$@"
 TIDY_PARK_GATE
-  printf '#!/bin/sh\nexit 0\n' > "$tidy_park_stub/sleep"
+  # Park's retry loops must keep a real backoff here. Stubbing sleep to exit 0
+  # made its write-gate budget (80 polls) elapse in microseconds, so whether
+  # park won the gate before tidy released it came down to scheduler luck. That
+  # passed consistently on macOS and failed intermittently on Linux CI. Sleep a
+  # short fixed interval instead of the requested one: the race still runs, the
+  # budget is no longer spent instantly, and the added wall time is bounded by
+  # the polling caps (~1s worst case).
+  printf '#!/bin/sh\nexec "$FOCUS_REAL_SLEEP" 0.01\n' > "$tidy_park_stub/sleep"
   chmod +x "$tidy_park_stub/mkdir" "$tidy_park_stub/sleep"
   tidy_park_ready="$race_home/tidy-park.ready"
   env -i HOME="$race_home" PATH="$tidy_park_stub:$race_path" \
