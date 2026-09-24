@@ -2,7 +2,7 @@
 
 A cross-session task ledger for Claude Code, with soft nudges. Park open threads that survive restarts, have them replayed when you open a session, and get a quiet flag when one goes stale. The tool holds the state so you don't have to remember to.
 
-**Current release:** `1.3.0`. This release adds a UserPromptSubmit hook: when a message announces an aside with `sidenote`, `side note`, or `btw`, it reminds the model to offer to park an unfinished thread, backing up the prose instruction `setup` installs. 1.2.2 made `doctor` report the preconditions `tidy --apply` enforces, preserved the ledger's permission bits, refused a non-regular setup target, and serialized concurrent setup runs. In 1.2.0 the optional pre-write nudge became opt-in: `FOCUS_WRITE_CHECK` must be `on` or `strict`; unset, `off`, and other values are silent.
+**Current release:** `1.3.0`. This release adds a UserPromptSubmit hook: when a message announces an aside with `sidenote`, `side note`, or `btw`, it reminds the model to offer to park an unfinished thread, and when a message floats an idea such as `would be nice` or `need a new feature`, to keep working and offer to park the idea. Both back up the prose instruction `setup` installs, which now covers side ideas too. 1.2.2 made `doctor` report the preconditions `tidy --apply` enforces, preserved the ledger's permission bits, refused a non-regular setup target, and serialized concurrent setup runs. In 1.2.0 the optional pre-write nudge became opt-in: `FOCUS_WRITE_CHECK` must be `on` or `strict`; unset, `off`, and other values are silent.
 
 ## What it does
 
@@ -33,7 +33,7 @@ You can also say it in plain English. The command descriptions let Claude choose
 - **SessionStart** runs on startup, resume, clear, and compact. It replays open Parked lines into the new session as explicitly marked untrusted text. It stays silent if nothing is available.
 - **Stop** emits a soft stale-item note only when an eligible item is stale and neither snooze nor cooldown suppresses it. The default cooldown is 14,400 seconds (four hours). Lock/read, clock, parser, and serialization failures stay silent; once a note is emitted, cooldown-marker publication fails open, so a marker-write failure can allow another note on the next Stop.
 - **PreToolUse** matches `Write` and `Edit` but is **off by default**. `FOCUS_WRITE_CHECK=on` adds a fixed, non-blocking note. `strict` asks for confirmation through the normal permission flow. It never returns a deny decision.
-- **UserPromptSubmit** backs up the pivot-park instruction from `setup`. When your message announces an aside with `sidenote`, `side note`, or `btw`, it adds one line reminding the model to offer to park an unfinished thread. It matches only those words, so an unannounced topic change still relies on the instruction alone. It never blocks and prints nothing otherwise.
+- **UserPromptSubmit** backs up the park instructions from `setup`. When your message announces an aside with `sidenote`, `side note`, or `btw`, it adds one line reminding the model to offer to park the unfinished thread you are leaving. When it floats an idea with `would be nice`, `nice to have`, `at some point`, `someday`, `down the line`, `feature idea`, or `need a new feature`, it adds one line telling the model to keep the current task and offer to park the idea. It matches only those phrases, so an unannounced pivot or idea still relies on the instruction alone. It never blocks and prints nothing otherwise.
 
 ## Ledger and file-format contract
 
@@ -159,7 +159,7 @@ A successful read-after-write check is not an `fsync` or stable-storage guarante
 
 There are no network calls. Trust is local filesystem access plus what plugin output exposes to the configured model:
 
-- SessionStart sends parked lines into model context automatically. Stop can send up to three stale item texts in a `systemMessage`. UserPromptSubmit reads each message you send, matches it against three fixed words, and stores and transmits nothing. Its only output is one fixed line of its own text. Command output and candidate/report rows are also read by the model when you invoke a command. Do not put passwords, credentials, private keys, tokens, or other secrets in the ledger.
+- SessionStart sends parked lines into model context automatically. Stop can send up to three stale item texts in a `systemMessage`. UserPromptSubmit reads each message you send, matches it against a fixed phrase list, and stores and transmits nothing. Its only output is up to two fixed lines of its own text. Command output and candidate/report rows are also read by the model when you invoke a command. Do not put passwords, credentials, private keys, tokens, or other secrets in the ledger.
 - Ledger records are inert, untrusted data. Scripts never evaluate them as shell or awk source. Dynamic parser values travel through the environment, and command prompts relay escaped TSV fields rather than executing them.
 - `doctor` is strictly read-only: it does not acquire locks, create scratch files, remove artifacts, or repair text. Tidy report mode is also read-only.
 - A guarded ledger rewrite preserves the ledger's existing permission bits, so park, resume, done, snooze, and tidy apply never silently retighten a file you deliberately widened. A ledger created from scratch gets the mode your umask implies.

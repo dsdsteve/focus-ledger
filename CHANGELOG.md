@@ -7,15 +7,25 @@ All notable changes to focus-ledger are documented here. Format follows
 ## [1.3.0] — 2026-09-24
 
 ### Added
-- A UserPromptSubmit hook backs up the pivot-park instruction that `setup`
+- A UserPromptSubmit hook backs up the park instructions that `setup`
   installs. When a message announces an aside with `sidenote`, `side note`, or
-  `btw`, it adds one fixed line reminding the model to offer to park an
-  unfinished thread. The prose instruction alone failed on exactly this case:
-  an announced aside read as not a real pivot and then grew into its own
-  thread. The hook decides only that the user flagged a switch; whether the
-  earlier thread is unfinished stays the model's call. It matches three words,
-  so an unannounced topic change still relies on the instruction. It reads
-  prompt text, stores and transmits nothing, and never blocks.
+  `btw`, it adds one fixed line reminding the model to offer to park the
+  unfinished thread being left. The prose instruction alone failed on exactly
+  this case: an announced aside read as not a real pivot and then grew into
+  its own thread. The hook decides only that the user flagged a switch.
+  Whether the earlier thread is unfinished stays the model's call.
+- The same hook covers ideas floated mid-task. On `would be nice`, `nice to
+  have`, `at some point`, `someday`, `down the line`, `feature idea`, or
+  `need a new feature`, it tells the model to keep the current task and offer
+  to park the idea. It leaves out bare `new feature` and `might need`, which
+  usually mean build it now or appear in ordinary requests.
+- The managed `CLAUDE.md` block from `setup` gains one sentence asking the
+  model to offer to park a new idea or feature raised mid-task, which covers
+  ideas that arrive without a cue phrase. Re-run `/focus-ledger:setup` to
+  update an installed block.
+- The hook matches a fixed phrase list, so an unannounced pivot or idea still
+  relies on the instruction. It reads prompt text, stores and transmits
+  nothing, and never blocks.
 
 ### Fixed
 - README's recovery-limits list said setup has no lock after 1.2.2 gave it

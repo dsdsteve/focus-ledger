@@ -157,17 +157,21 @@ run_pretooluse_exact_checks() {
 run_prompt_hook_checks() {
   sh_bin=$1
   prompt_cmd=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["hooks"]["UserPromptSubmit"][0]["hooks"][0]["command"])' \
-    "$ROOT/hooks/hooks.json") || { report_case "$sh_bin" "prompt hook: flagged aside fires, ordinary text stays silent" 0 "command unreadable"; return; }
+    "$ROOT/hooks/hooks.json") || { report_case "$sh_bin" "prompt hook: pivot and side-idea cues fire, ordinary text stays silent" 0 "command unreadable"; return; }
   prompt_ok=1; prompt_why=""
   for prompt_hit in 'sidenote check the ticket' 'Side note: also X' 'ok, BTW, other thing'; do
     prompt_out=$(printf '{"prompt":"%s"}' "$prompt_hit" | "$sh_bin" -c "$prompt_cmd"); prompt_rc=$?
-    [ "$prompt_rc" = 0 ] && [ -n "$prompt_out" ] || { prompt_ok=0; prompt_why="$prompt_why; missed: $prompt_hit (rc=$prompt_rc)"; }
+    [ "$prompt_rc" = 0 ] && printf '%s' "$prompt_out" | grep -q 'topic switch' || { prompt_ok=0; prompt_why="$prompt_why; missed pivot: $prompt_hit (rc=$prompt_rc)"; }
   done
-  for prompt_miss in 'run these separately' 'the subtwig module' 'continue with pass 4'; do
+  for prompt_idea in 'it would be nice to have this' 'it might need new feture' 'nice to have: dark mode'; do
+    prompt_out=$(printf '{"prompt":"%s"}' "$prompt_idea" | "$sh_bin" -c "$prompt_cmd"); prompt_rc=$?
+    [ "$prompt_rc" = 0 ] && printf '%s' "$prompt_out" | grep -q 'side idea' || { prompt_ok=0; prompt_why="$prompt_why; missed idea: $prompt_idea (rc=$prompt_rc)"; }
+  done
+  for prompt_miss in 'run these separately' 'the subtwig module' 'continue with pass 4' 'add a new feature to the parser' 'this might need a test'; do
     prompt_out=$(printf '{"prompt":"%s"}' "$prompt_miss" | "$sh_bin" -c "$prompt_cmd"); prompt_rc=$?
     [ "$prompt_rc" = 0 ] && [ -z "$prompt_out" ] || { prompt_ok=0; prompt_why="$prompt_why; false fire: $prompt_miss (rc=$prompt_rc)"; }
   done
-  report_case "$sh_bin" "prompt hook: flagged aside fires, ordinary text stays silent" "$prompt_ok" "${prompt_why#; }"
+  report_case "$sh_bin" "prompt hook: pivot and side-idea cues fire, ordinary text stays silent" "$prompt_ok" "${prompt_why#; }"
 }
 
 run_stop_state_checks() {
@@ -1035,6 +1039,9 @@ When I pivot off an unfinished thread to a new topic, answer the new thing and
 then offer in one line to park the old one (e.g. "want me to park <old thing>?").
 Offer, don't auto-park. One line, not a paragraph. Only on a real pivot off
 something unfinished — not every topic change.
+
+When I float a new idea or feature mid-task, keep going and offer in one
+line to park the idea.
 <!-- FOCUS-LEDGER:END -->
 CANONICAL_SETUP
   setup_ok=1; setup_why=""
@@ -3780,7 +3787,7 @@ expected = {
     "SessionStart": ("startup|resume|clear|compact", "${CLAUDE_PLUGIN_ROOT}/hooks/focus-session-start.sh", 5),
     "Stop": ("", "${CLAUDE_PLUGIN_ROOT}/hooks/focus-stop.sh", 5),
     "PreToolUse": ("Write|Edit", "${CLAUDE_PLUGIN_ROOT}/hooks/focus-pretooluse.sh", 5),
-    "UserPromptSubmit": ("", "grep -qiE 'side ?note|(^|[^a-z])btw([^a-z]|$)' && echo 'User flagged a topic switch. If the previous thread is unfinished, answer this, then offer in one line to park it.' || true", 5),
+    "UserPromptSubmit": ("", "in=$(cat); printf %s \"$in\" | grep -qiE 'side ?note|(^|[^a-z])btw([^a-z]|$)' && echo 'User flagged a topic switch. If the previous thread is unfinished, answer this, then offer in one line to park it.'; printf %s \"$in\" | grep -qiE 'would be nice|nice to have|at some point|someday|down the line|feature idea|need (a )?new fea?ture' && echo 'User floated a side idea. Keep the current task; offer in one line to park the idea.'; true", 5),
 }
 assert set(manifest) == {"hooks"}
 assert set(manifest["hooks"]) == set(expected)

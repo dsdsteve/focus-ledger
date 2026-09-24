@@ -267,6 +267,9 @@ When I pivot off an unfinished thread to a new topic, answer the new thing and
 then offer in one line to park the old one (e.g. "want me to park <old thing>?").
 Offer, don't auto-park. One line, not a paragraph. Only on a real pivot off
 something unfinished — not every topic change.
+
+When I float a new idea or feature mid-task, keep going and offer in one
+line to park the idea.
 <!-- FOCUS-LEDGER:END -->
 BLOCK
   fi
