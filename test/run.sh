@@ -3640,11 +3640,15 @@ EOF_RUNTIME_VARS
   static_commands_why=""
   static_command_count=0
   static_command_names=""
-  for static_command_file in "$ROOT"/commands/*.md; do
+  # A user-facing verb ships either as a legacy commands/<name>.md file or as
+  # skills/<name>/SKILL.md, which Claude Code and Kiro both load.
+  for static_command_file in "$ROOT"/commands/*.md "$ROOT"/skills/*/SKILL.md; do
     [ -f "$static_command_file" ] || continue
     static_command_count=$((static_command_count + 1))
-    static_command_name=${static_command_file##*/}
-    static_command_name=${static_command_name%.md}
+    case $static_command_file in
+      */SKILL.md) static_command_name=${static_command_file%/SKILL.md}; static_command_name=${static_command_name##*/} ;;
+      *) static_command_name=${static_command_file##*/}; static_command_name=${static_command_name%.md} ;;
+    esac
     static_command_names="$static_command_names
 $static_command_name"
     if ! grep -qF -- "- **\`/focus-ledger:$static_command_name" "$ROOT/README.md"; then
@@ -3677,7 +3681,8 @@ $static_command_name"
     sed 's#^/focus-ledger:##' | sort -u)
   while IFS= read -r static_readme_command; do
     [ -n "$static_readme_command" ] || continue
-    if [ ! -f "$ROOT/commands/$static_readme_command.md" ]; then
+    if [ ! -f "$ROOT/commands/$static_readme_command.md" ] &&
+       [ ! -f "$ROOT/skills/$static_readme_command/SKILL.md" ]; then
       static_commands_ok=0
       static_commands_why="$static_commands_why; README lists unknown command $static_readme_command"
     fi
