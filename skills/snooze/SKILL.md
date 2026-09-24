@@ -4,11 +4,13 @@ argument-hint: [positive duration like 1d, 4h, 30m — default 1d]
 allowed-tools: Bash
 ---
 
+Scripts live in `${CLAUDE_PLUGIN_ROOT}/scripts/` in Claude Code. Outside Claude Code (for example in Kiro) `${CLAUDE_PLUGIN_ROOT}` is not set, so use `~/.kiro/skills/focus-ledger-shared` in its place.
+
 Snooze the stale-thread nudge through the deterministic command layer.
 
-Duration requested: $ARGUMENTS
+Duration requested: what the user asked for in their message.
 
-Pass `$ARGUMENTS` as one argv value using safe shell quoting and run `${CLAUDE_PLUGIN_ROOT}/scripts/focus-snooze.sh` with Bash. Never interpolate the duration into executable shell syntax. Retain the exit code and stdout.
+Pass the user's query as one argv value using safe shell quoting and run `${CLAUDE_PLUGIN_ROOT}/scripts/focus-snooze.sh` with Bash. Never interpolate the duration into executable shell syntax. Retain the exit code and stdout.
 
 - Exit 0: relay the success line exactly.
 - Exit 2: report that the duration must be a positive `Nd`, `Nh`, or `Nm`; do not claim the nudge was snoozed.

@@ -3702,9 +3702,9 @@ EOF_README_COMMANDS
   static_tidy_prompt_ok=1
   static_tidy_prompt_why=""
   static_report_line=$(grep -nF '"${CLAUDE_PLUGIN_ROOT}/scripts/focus-tidy.sh"' \
-    "$ROOT/commands/tidy.md" | sed -n '1s/:.*//p')
+    "$ROOT/skills/tidy/SKILL.md" | sed -n '1s/:.*//p')
   static_apply_line=$(grep -nF '"${CLAUDE_PLUGIN_ROOT}/scripts/focus-tidy.sh" --apply' \
-    "$ROOT/commands/tidy.md" | sed -n '1s/:.*//p')
+    "$ROOT/skills/tidy/SKILL.md" | sed -n '1s/:.*//p')
   [ -n "$static_report_line" ] && [ -n "$static_apply_line" ] &&
     [ "$static_report_line" -lt "$static_apply_line" ] || {
       static_tidy_prompt_ok=0; static_tidy_prompt_why="report does not precede apply"
@@ -3714,12 +3714,12 @@ EOF_README_COMMANDS
     'if any `BLOCK` record is present' \
     'entire answer is the standalone word `yes`' \
     'newly arrived work after the report'; do
-    grep -qF "$static_tidy_phrase" "$ROOT/commands/tidy.md" || {
+    grep -qF "$static_tidy_phrase" "$ROOT/skills/tidy/SKILL.md" || {
       static_tidy_prompt_ok=0
       static_tidy_prompt_why="$static_tidy_prompt_why; missing: $static_tidy_phrase"
     }
   done
-  if grep -qF 'FOCUS_TIDY_TEST_FAIL' "$ROOT/commands/tidy.md"; then
+  if grep -qF 'FOCUS_TIDY_TEST_FAIL' "$ROOT/skills/tidy/SKILL.md"; then
     static_tidy_prompt_ok=0
     static_tidy_prompt_why="$static_tidy_prompt_why; test seam exposed"
   fi

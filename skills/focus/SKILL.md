@@ -4,6 +4,8 @@ argument-hint: (no args) — just shows the ledger
 allowed-tools: Bash
 ---
 
+Scripts live in `${CLAUDE_PLUGIN_ROOT}/scripts/` in Claude Code. Outside Claude Code (for example in Kiro) `${CLAUDE_PLUGIN_ROOT}` is not set, so use `~/.kiro/skills/focus-ledger-shared` in its place.
+
 Show the user's open threads using the deterministic read-only listing.
 
 Steps:
