@@ -4,6 +4,23 @@ All notable changes to focus-ledger are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/); this project uses
 [semantic versioning](https://semver.org/).
 
+## [1.3.0] — 2026-09-24
+
+### Added
+- A UserPromptSubmit hook backs up the pivot-park instruction that `setup`
+  installs. When a message announces an aside with `sidenote`, `side note`, or
+  `btw`, it adds one fixed line reminding the model to offer to park an
+  unfinished thread. The prose instruction alone failed on exactly this case:
+  an announced aside read as not a real pivot and then grew into its own
+  thread. The hook decides only that the user flagged a switch; whether the
+  earlier thread is unfinished stays the model's call. It matches three words,
+  so an unannounced topic change still relies on the instruction. It reads
+  prompt text, stores and transmits nothing, and never blocks.
+
+### Fixed
+- README's recovery-limits list said setup has no lock after 1.2.2 gave it
+  one, contradicting SECURITY.md and this changelog.
+
 ## [1.2.2] — 2026-09-21
 
 ### Fixed

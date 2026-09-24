@@ -2,7 +2,7 @@
 
 A cross-session task ledger for Claude Code, with soft nudges. Park open threads that survive restarts, have them replayed when you open a session, and get a quiet flag when one goes stale. The tool holds the state so you don't have to remember to.
 
-**Current release:** `1.2.2`. This patch makes `doctor` report the preconditions `tidy --apply` enforces so a clean report means apply can run, preserves the ledger's permission bits across guarded rewrites, refuses a non-regular setup target instead of hanging on it, and serializes concurrent setup runs with a lock so neither run deletes the other's recovery backup. In 1.2.0 the optional pre-write nudge became opt-in: `FOCUS_WRITE_CHECK` must be `on` or `strict`; unset, `off`, and other values are silent.
+**Current release:** `1.3.0`. This release adds a UserPromptSubmit hook: when a message announces an aside with `sidenote`, `side note`, or `btw`, it reminds the model to offer to park an unfinished thread, backing up the prose instruction `setup` installs. 1.2.2 made `doctor` report the preconditions `tidy --apply` enforces, preserved the ledger's permission bits, refused a non-regular setup target, and serialized concurrent setup runs. In 1.2.0 the optional pre-write nudge became opt-in: `FOCUS_WRITE_CHECK` must be `on` or `strict`; unset, `off`, and other values are silent.
 
 ## What it does
 
@@ -33,6 +33,7 @@ You can also say it in plain English. The command descriptions let Claude choose
 - **SessionStart** runs on startup, resume, clear, and compact. It replays open Parked lines into the new session as explicitly marked untrusted text. It stays silent if nothing is available.
 - **Stop** emits a soft stale-item note only when an eligible item is stale and neither snooze nor cooldown suppresses it. The default cooldown is 14,400 seconds (four hours). Lock/read, clock, parser, and serialization failures stay silent; once a note is emitted, cooldown-marker publication fails open, so a marker-write failure can allow another note on the next Stop.
 - **PreToolUse** matches `Write` and `Edit` but is **off by default**. `FOCUS_WRITE_CHECK=on` adds a fixed, non-blocking note. `strict` asks for confirmation through the normal permission flow. It never returns a deny decision.
+- **UserPromptSubmit** backs up the pivot-park instruction from `setup`. When your message announces an aside with `sidenote`, `side note`, or `btw`, it adds one line reminding the model to offer to park an unfinished thread. It matches only those words, so an unannounced topic change still relies on the instruction alone. It never blocks and prints nothing otherwise.
 
 ## Ledger and file-format contract
 
@@ -57,7 +58,7 @@ For deterministic listing, matching, completion, and cleanup:
 - `focus`, matching, Stop, and tidy skip malformed or near-miss records rather than guessing. `doctor` reports the exact line and hand-fix without changing it. Tidy also reports malformed lines as `SKIP` and leaves them byte-for-byte unchanged.
 - SessionStart retains a legacy, more permissive replay rule for column-one open lines under a heading beginning `## Parked`; run `doctor` if SessionStart shows something that `focus` omits.
 
-This is **format v1**. Release 1.2.2 does not change it.
+This is **format v1**. Release 1.3.0 does not change it.
 
 ### Ranking and selection
 
@@ -158,7 +159,7 @@ A successful read-after-write check is not an `fsync` or stable-storage guarante
 
 There are no network calls. Trust is local filesystem access plus what plugin output exposes to the configured model:
 
-- SessionStart sends parked lines into model context automatically. Stop can send up to three stale item texts in a `systemMessage`. Command output and candidate/report rows are also read by the model when you invoke a command. Do not put passwords, credentials, private keys, tokens, or other secrets in the ledger.
+- SessionStart sends parked lines into model context automatically. Stop can send up to three stale item texts in a `systemMessage`. UserPromptSubmit reads each message you send, matches it against three fixed words, and stores and transmits nothing. Its only output is one fixed line of its own text. Command output and candidate/report rows are also read by the model when you invoke a command. Do not put passwords, credentials, private keys, tokens, or other secrets in the ledger.
 - Ledger records are inert, untrusted data. Scripts never evaluate them as shell or awk source. Dynamic parser values travel through the environment, and command prompts relay escaped TSV fields rather than executing them.
 - `doctor` is strictly read-only: it does not acquire locks, create scratch files, remove artifacts, or repair text. Tidy report mode is also read-only.
 - A guarded ledger rewrite preserves the ledger's existing permission bits, so park, resume, done, snooze, and tidy apply never silently retighten a file you deliberately widened. A ledger created from scratch gets the mode your umask implies.

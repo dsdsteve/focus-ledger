@@ -152,6 +152,24 @@ run_pretooluse_exact_checks() {
   rm -rf "$pre_home" "$pre_stub"
 }
 
+# UserPromptSubmit is an inline command in hooks.json, so read the shipped
+# string from the manifest rather than a copy that could drift from it.
+run_prompt_hook_checks() {
+  sh_bin=$1
+  prompt_cmd=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["hooks"]["UserPromptSubmit"][0]["hooks"][0]["command"])' \
+    "$ROOT/hooks/hooks.json") || { report_case "$sh_bin" "prompt hook: flagged aside fires, ordinary text stays silent" 0 "command unreadable"; return; }
+  prompt_ok=1; prompt_why=""
+  for prompt_hit in 'sidenote check the ticket' 'Side note: also X' 'ok, BTW, other thing'; do
+    prompt_out=$(printf '{"prompt":"%s"}' "$prompt_hit" | "$sh_bin" -c "$prompt_cmd"); prompt_rc=$?
+    [ "$prompt_rc" = 0 ] && [ -n "$prompt_out" ] || { prompt_ok=0; prompt_why="$prompt_why; missed: $prompt_hit (rc=$prompt_rc)"; }
+  done
+  for prompt_miss in 'run these separately' 'the subtwig module' 'continue with pass 4'; do
+    prompt_out=$(printf '{"prompt":"%s"}' "$prompt_miss" | "$sh_bin" -c "$prompt_cmd"); prompt_rc=$?
+    [ "$prompt_rc" = 0 ] && [ -z "$prompt_out" ] || { prompt_ok=0; prompt_why="$prompt_why; false fire: $prompt_miss (rc=$prompt_rc)"; }
+  done
+  report_case "$sh_bin" "prompt hook: flagged aside fires, ordinary text stays silent" "$prompt_ok" "${prompt_why#; }"
+}
+
 run_stop_state_checks() {
   sh_bin=$1
   command -v "$sh_bin" >/dev/null 2>&1 || return
@@ -421,6 +439,9 @@ run_suite() {
 
   # PreToolUse: exact opt-in payloads, exact silence, and no serializer dependency.
   run_pretooluse_exact_checks "$sh_bin"
+
+  # UserPromptSubmit: announced asides fire, ordinary text stays silent.
+  run_prompt_hook_checks "$sh_bin"
 }
 
 # --- security: the stop hook must NOT execute text embedded in the ledger ---
@@ -3703,10 +3724,10 @@ EOF_README_COMMANDS
     "$ROOT/README.md" | sed -n '1p')
   static_version_ok=1
   static_version_why=""
-  if [ "$static_plugin_version" != 1.2.2 ] ||
-     [ "$static_marketplace_version" != 1.2.2 ] ||
-     [ "$static_changelog_version" != 1.2.2 ] ||
-     [ "$static_readme_version" != 1.2.2 ]; then
+  if [ "$static_plugin_version" != 1.3.0 ] ||
+     [ "$static_marketplace_version" != 1.3.0 ] ||
+     [ "$static_changelog_version" != 1.3.0 ] ||
+     [ "$static_readme_version" != 1.3.0 ]; then
     static_version_ok=0
     static_version_why="plugin=$static_plugin_version marketplace=$static_marketplace_version changelog=$static_changelog_version README=$static_readme_version"
   elif ! grep -qi 'opt-in' "$ROOT/README.md" ||
@@ -3718,7 +3739,7 @@ EOF_README_COMMANDS
     static_version_ok=0
     static_version_why="Epic 1 cherry-pickable 1.1.2 patch note missing from CHANGELOG"
   fi
-  report_case static "release: metadata, README, and CHANGELOG agree on 1.2.2" \
+  report_case static "release: metadata, README, and CHANGELOG agree on 1.3.0" \
     "$static_version_ok" "$static_version_why"
 
   static_exec_ok=1
@@ -3748,17 +3769,18 @@ with open(sys.argv[3], encoding="utf-8") as stream:
     manifest = json.load(stream)
 
 assert plugin["name"] == "focus-ledger"
-assert plugin["version"] == "1.2.2"
+assert plugin["version"] == "1.3.0"
 assert marketplace["name"] == "focus-ledger"
 assert len(marketplace["plugins"]) == 1
 assert marketplace["plugins"][0]["name"] == "focus-ledger"
 assert marketplace["plugins"][0]["source"] == "./"
-assert marketplace["plugins"][0]["version"] == "1.2.2"
+assert marketplace["plugins"][0]["version"] == "1.3.0"
 
 expected = {
     "SessionStart": ("startup|resume|clear|compact", "${CLAUDE_PLUGIN_ROOT}/hooks/focus-session-start.sh", 5),
     "Stop": ("", "${CLAUDE_PLUGIN_ROOT}/hooks/focus-stop.sh", 5),
     "PreToolUse": ("Write|Edit", "${CLAUDE_PLUGIN_ROOT}/hooks/focus-pretooluse.sh", 5),
+    "UserPromptSubmit": ("", "grep -qiE 'side ?note|(^|[^a-z])btw([^a-z]|$)' && echo 'User flagged a topic switch. If the previous thread is unfinished, answer this, then offer in one line to park it.' || true", 5),
 }
 assert set(manifest) == {"hooks"}
 assert set(manifest["hooks"]) == set(expected)

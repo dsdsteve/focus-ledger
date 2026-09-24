@@ -12,7 +12,7 @@ The plugin makes **no network calls**. Its trust boundary still includes the loc
 
 - `CLAUDE_PLUGIN_ROOT` selects plugin code; `HOME`, `PWD`, and `PATH` select state paths and executables. Treat those inputs and the installed plugin files as trusted code/configuration.
 - Ledger items are untrusted, inert text. The shell never evaluates an item, and dynamic values reach awk through environment data rather than generated source. Command prompts relay escaped TSV records; they do not execute fields returned by list, match, doctor, or tidy.
-- SessionStart automatically puts parked lines into model context. Stop may put up to three stale item texts into a `systemMessage`. Invoked commands also return ledger text, candidates, or diagnostic/report rows to the model. **Do not park secrets**, including credentials, private keys, tokens, passwords, or sensitive customer data.
+- SessionStart automatically puts parked lines into model context. Stop may put up to three stale item texts into a `systemMessage`. UserPromptSubmit reads the text of every prompt to match three fixed words. It stores nothing, makes no network call, and never echoes prompt text. Its only output is one fixed line. Invoked commands also return ledger text, candidates, or diagnostic/report rows to the model. **Do not park secrets**, including credentials, private keys, tokens, passwords, or sensitive customer data.
 - Setup installs model instructions in `CLAUDE.md`; the managed text can influence future sessions. Inspect it before enabling it globally.
 - Hooks never return a deny decision. PreToolUse is silent unless `FOCUS_WRITE_CHECK=on|strict`; `strict` asks through the ordinary permission flow.
 

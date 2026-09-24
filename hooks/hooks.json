@@ -35,6 +35,18 @@
           }
         ]
       }
+    ],
+    "UserPromptSubmit": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "grep -qiE 'side ?note|(^|[^a-z])btw([^a-z]|$)' && echo 'User flagged a topic switch. If the previous thread is unfinished, answer this, then offer in one line to park it.' || true",
+            "timeout": 5
+          }
+        ]
+      }
     ]
   }
 }
