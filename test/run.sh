@@ -152,26 +152,44 @@ run_pretooluse_exact_checks() {
   rm -rf "$pre_home" "$pre_stub"
 }
 
-# UserPromptSubmit is an inline command in hooks.json, so read the shipped
-# string from the manifest rather than a copy that could drift from it.
+# UserPromptSubmit: each row is want|payload. P = topic-switch line, I = side-idea
+# line, - = silent. Payloads are full JSON, because the hook must read only the
+# prompt field and ignore cwd and transcript paths.
 run_prompt_hook_checks() {
   sh_bin=$1
-  prompt_cmd=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["hooks"]["UserPromptSubmit"][0]["hooks"][0]["command"])' \
-    "$ROOT/hooks/hooks.json") || { report_case "$sh_bin" "prompt hook: pivot and side-idea cues fire, ordinary text stays silent" 0 "command unreadable"; return; }
   prompt_ok=1; prompt_why=""
-  for prompt_hit in 'sidenote check the ticket' 'Side note: also X' 'ok, BTW, other thing'; do
-    prompt_out=$(printf '{"prompt":"%s"}' "$prompt_hit" | "$sh_bin" -c "$prompt_cmd"); prompt_rc=$?
-    [ "$prompt_rc" = 0 ] && printf '%s' "$prompt_out" | grep -q 'topic switch' || { prompt_ok=0; prompt_why="$prompt_why; missed pivot: $prompt_hit (rc=$prompt_rc)"; }
-  done
-  for prompt_idea in 'it would be nice to have this' 'it might need new feture' 'nice to have: dark mode'; do
-    prompt_out=$(printf '{"prompt":"%s"}' "$prompt_idea" | "$sh_bin" -c "$prompt_cmd"); prompt_rc=$?
-    [ "$prompt_rc" = 0 ] && printf '%s' "$prompt_out" | grep -q 'side idea' || { prompt_ok=0; prompt_why="$prompt_why; missed idea: $prompt_idea (rc=$prompt_rc)"; }
-  done
-  for prompt_miss in 'run these separately' 'the subtwig module' 'continue with pass 4' 'add a new feature to the parser' 'this might need a test'; do
-    prompt_out=$(printf '{"prompt":"%s"}' "$prompt_miss" | "$sh_bin" -c "$prompt_cmd"); prompt_rc=$?
-    [ "$prompt_rc" = 0 ] && [ -z "$prompt_out" ] || { prompt_ok=0; prompt_why="$prompt_why; false fire: $prompt_miss (rc=$prompt_rc)"; }
-  done
-  report_case "$sh_bin" "prompt hook: pivot and side-idea cues fire, ordinary text stays silent" "$prompt_ok" "${prompt_why#; }"
+  while IFS='|' read -r prompt_want prompt_json; do
+    [ -n "$prompt_want" ] || continue
+    prompt_out=$(printf '%s' "$prompt_json" | "$sh_bin" "$ROOT/hooks/focus-prompt.sh"); prompt_rc=$?
+    prompt_got=-
+    if printf '%s' "$prompt_out" | grep -q 'side idea'; then prompt_got=I
+    elif printf '%s' "$prompt_out" | grep -q 'topic switch'; then prompt_got=P; fi
+    [ "$prompt_rc" = 0 ] && [ "$prompt_got" = "$prompt_want" ] ||
+      { prompt_ok=0; prompt_why="$prompt_why; want $prompt_want got $prompt_got (rc=$prompt_rc): $prompt_json"; }
+  done <<'PROMPT_CASES'
+P|{"prompt":"sidenote check the ticket"}
+P|{"prompt":"Side note: also X"}
+P|{"prompt":"ok, BTW, other thing"}
+P|{"prompt":"done.\nbtw check X"}
+I|{"prompt":"it would be nice to have this"}
+I|{"prompt":"it might need new feture"}
+I|{"prompt":"nice to have: dark mode"}
+I|{"prompt":"btw, would be nice to have X"}
+-|{"prompt":"read the outside note first"}
+-|{"prompt":"at some point it crashes with a 500"}
+-|{"prompt":"down the line the parser fails"}
+-|{"prompt":"we need a new feature flag here"}
+-|{"prompt":"add a new feature to the parser"}
+-|{"prompt":"this might need a test"}
+-|{"prompt":"the subtwig module"}
+-|{"prompt":"fix the bug","cwd":"/Users/x/src/btw-service"}
+-|{"transcript_path":"/Users/x/.claude/projects/-Users-x-someday/a.jsonl","prompt":"fix the bug"}
+P|{"prompt":"say \"hi\" to X. btw check Y"}
+I|{"prompt":"quote \"would be nice\" here"}
+-|{"prompt":"fix \"the bug\"","cwd":"/x/btw"}
+-|not json at all
+PROMPT_CASES
+  report_case "$sh_bin" "prompt hook: reads only the prompt; idea and pivot cues fire, ordinary text stays silent" "$prompt_ok" "${prompt_why#; }"
 }
 
 run_stop_state_checks() {
@@ -3792,7 +3810,7 @@ expected = {
     "SessionStart": ("startup|resume|clear|compact", "${CLAUDE_PLUGIN_ROOT}/hooks/focus-session-start.sh", 5),
     "Stop": ("", "${CLAUDE_PLUGIN_ROOT}/hooks/focus-stop.sh", 5),
     "PreToolUse": ("Write|Edit", "${CLAUDE_PLUGIN_ROOT}/hooks/focus-pretooluse.sh", 5),
-    "UserPromptSubmit": ("", "in=$(cat); printf %s \"$in\" | grep -qiE 'side ?note|(^|[^a-z])btw([^a-z]|$)' && echo 'User flagged a topic switch. If the previous thread is unfinished, answer this, then offer in one line to park it.'; printf %s \"$in\" | grep -qiE 'would be nice|nice to have|at some point|someday|down the line|feature idea|need (a )?new fea?ture' && echo 'User floated a side idea. Keep the current task; offer in one line to park the idea.'; true", 5),
+    "UserPromptSubmit": ("", "${CLAUDE_PLUGIN_ROOT}/hooks/focus-prompt.sh", 5),
 }
 assert set(manifest) == {"hooks"}
 assert set(manifest["hooks"]) == set(expected)

@@ -4,15 +4,15 @@ argument-hint: [which thread — a number from /focus-ledger:focus, or words to 
 allowed-tools: Bash
 ---
 
-Scripts live in `${CLAUDE_PLUGIN_ROOT}/scripts/` in Claude Code. Outside Claude Code (for example in Kiro) `${CLAUDE_PLUGIN_ROOT}` is not set, so use `~/.kiro/skills/focus-ledger-shared` in its place.
+Scripts live in `${CLAUDE_PLUGIN_ROOT}/scripts/` in Claude Code. Outside Claude Code (for example in Kiro) `${CLAUDE_PLUGIN_ROOT}` is not set, so use `$HOME/.kiro/skills/focus-ledger-shared` in its place.
 
 Resume one parked thread through the deterministic command layer.
 
-Which thread: the one the user named in their message.
+Which thread: the one named in the arguments or the user's message, or the thread the user has just agreed to act on.
 
 Steps:
-1. If the user named no thread, ask which thread to resume and stop.
-2. Pass the user's query as one argv value using safe shell quoting and run `${CLAUDE_PLUGIN_ROOT}/scripts/focus-resume.sh` with Bash. Never interpolate the query into executable shell syntax. Retain the exit code and stdout.
+1. If no thread is identified, ask which thread to resume and stop.
+2. Pass just the thread query (a rank number or matching words, not the whole message) as one argv value using safe shell quoting and run `${CLAUDE_PLUGIN_ROOT}/scripts/focus-resume.sh` with Bash. Never interpolate the query into executable shell syntax. Retain the exit code and stdout.
 3. The script returns safe TSV rows shaped as `rank<TAB>section<TAB>source_line<TAB>escaped_raw_item`. In user-owned fields, `\\`, `\t`, and `\r` are visible escapes and other control bytes become `?`; keep controls inert when formatting.
    - Exit 0: exactly one item moved. For display only, remove the exact `- [ ] (YYYY-MM-DD) ` prefix from the returned raw item and confirm: `<thing> — back in this session.`
    - Exit 1: say no parked thread matched and ask for another number or phrase.

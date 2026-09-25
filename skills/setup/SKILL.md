@@ -4,9 +4,9 @@ argument-hint: [local | global | remove]
 allowed-tools: Bash, AskUserQuestion
 ---
 
-Scripts live in `${CLAUDE_PLUGIN_ROOT}/scripts/` in Claude Code. Outside Claude Code (for example in Kiro) `${CLAUDE_PLUGIN_ROOT}` is not set, so use `~/.kiro/skills/focus-ledger-shared` in its place.
+Scripts live in `${CLAUDE_PLUGIN_ROOT}/scripts/` in Claude Code. Outside Claude Code (for example in Kiro) `${CLAUDE_PLUGIN_ROOT}` is not set, so use `$HOME/.kiro/skills/focus-ledger-shared` in its place.
 
-Install the one focus-ledger behavior that can't be a hook: when the user pivots off an unfinished thread, the assistant offers (in one line) to park the old one. It lives as a managed, idempotent block in CLAUDE.md — re-running updates it in place; removing takes it out cleanly.
+Install the park-offer instruction: when the user pivots off an unfinished thread, or floats a new idea mid-task, the assistant offers in one line to park it. A UserPromptSubmit hook reminds the model when a message carries a cue phrase, but most pivots and ideas carry none, so the instruction itself lives in CLAUDE.md. It lives as a managed, idempotent block in CLAUDE.md — re-running updates it in place; removing takes it out cleanly.
 
 Requested: what the user asked for in their message.
 
@@ -15,7 +15,7 @@ Steps:
 1. **If the request already says the scope**, skip the question:
    - contains `remove`/`off` and clearly refers to the pivot/setup block → removal (use the scope word if given, else `local`).
    - contains `global` → install global. contains `local` → install local.
-   - bare `uninstall` refers to the plugin, not this managed block. Explain that setup removal only removes the CLAUDE.md pivot instruction; do not silently translate plugin uninstall into `--remove`.
+   - bare `uninstall` refers to the plugin, not this managed block. Explain that setup removal only removes the CLAUDE.md park-offer instruction; do not silently translate plugin uninstall into `--remove`.
 
 2. **Otherwise ask once** (with AskUserQuestion where available, otherwise as one plain question) — this edits the user's CLAUDE.md, so which file is genuinely their call:
    - Question: "Install the focus-ledger pivot-park nudge where?"

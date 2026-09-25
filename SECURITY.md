@@ -75,7 +75,7 @@ Path defenses are operation-specific; there is no general filesystem sandbox:
 - Park can fall back to one append-only write when cooperative locking/publication cannot proceed. This protects existing bytes but can leave the record outside a required section for doctor/tidy to report or re-home.
 - Setup serializes concurrent runs on its target with the shared lock the ledger verbs use, so two runs cannot each take a backup and then delete the other's during rotation. It captures an existing regular source without following symlinks and atomically replaces the target pathname from a same-directory stage. A concurrent regular-file edit by something other than setup, landing after its final comparison, can still be replaced; use the retained backup to recover.
 
-The implementation is intentionally small (`hooks/`, `scripts/`, `commands/`, `skills/`) and is worth reviewing before trusting it on your machine.
+The implementation is intentionally small (`hooks/`, `scripts/`, `skills/`) and is worth reviewing before trusting it on your machine.
 
 ## Supported versions
 

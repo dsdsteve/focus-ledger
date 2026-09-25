@@ -15,10 +15,12 @@ All notable changes to focus-ledger are documented here. Format follows
   its own thread. The hook decides only that the user flagged a switch.
   Whether the earlier thread is unfinished stays the model's call.
 - The same hook covers ideas floated mid-task. On `would be nice`, `nice to
-  have`, `at some point`, `someday`, `down the line`, `feature idea`, or
-  `need a new feature`, it tells the model to keep the current task and offer
-  to park the idea. It leaves out bare `new feature` and `might need`, which
-  usually mean build it now or appear in ordinary requests.
+  have`, `someday`, `feature idea`, or `might need a new feature`, it tells the
+  model to keep the current task and offer to park the idea. An idea wins when
+  both kinds of cue appear. Cues match whole words in the prompt field only, so
+  paths such as the working directory never trigger it. Phrases common in
+  ordinary requests and bug reports, such as `at some point`, `down the line`,
+  and bare `need a new feature`, stay out.
 - The managed `CLAUDE.md` block from `setup` gains one sentence asking the
   model to offer to park a new idea or feature raised mid-task, which covers
   ideas that arrive without a cue phrase. Re-run `/focus-ledger:setup` to
@@ -26,6 +28,12 @@ All notable changes to focus-ledger are documented here. Format follows
 - The hook matches a fixed phrase list, so an unannounced pivot or idea still
   relies on the instruction. It reads prompt text, stores and transmits
   nothing, and never blocks.
+
+### Changed
+- The eight verbs moved from `commands/<verb>.md` to
+  `skills/<verb>/SKILL.md`. Command names stay `/focus-ledger:<verb>`. The files
+  no longer depend on `$ARGUMENTS`, and each names the Kiro script location
+  beside the Claude Code one, so the same files also load in Kiro.
 
 ### Fixed
 - README's recovery-limits list said setup has no lock after 1.2.2 gave it

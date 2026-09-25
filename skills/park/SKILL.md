@@ -4,17 +4,17 @@ argument-hint: [thing to come back to]
 allowed-tools: Bash
 ---
 
-Park a durable thread in the focus ledger. The thing to park is what the user asked to park in their message.
+Park a durable thread in the focus ledger. The thing to park is the item named in the arguments or the user's message. When the user has just accepted an offer to park a thread, it is that thread.
 
 Steps:
-1. If the user named nothing to park, ask what to park (one line) and stop — don't run the script with no argument.
+1. If there is still nothing to park, ask what to park (one line) and stop — don't run the script with no argument.
 2. Trim the thing to its essence (a short phrase, not a pasted paragraph), then run the bundled writer and retain its exit code and stdout:
 
    ```bash
    "${CLAUDE_PLUGIN_ROOT}/scripts/focus-park.sh" "<the trimmed thing>"
    ```
 
-   Outside Claude Code (for example in Kiro) `${CLAUDE_PLUGIN_ROOT}` is not set. Run `~/.kiro/skills/focus-ledger-shared/scripts/focus-park.sh` instead.
+   Outside Claude Code (for example in Kiro) `${CLAUDE_PLUGIN_ROOT}` is not set. Run `$HOME/.kiro/skills/focus-ledger-shared/scripts/focus-park.sh` instead.
 
    The script stamps today's date, inserts `- [ ] (YYYY-MM-DD) <thing>` in the Parked section when guarded rewriting is available, and creates the ledger with both sections if it does not exist. Its no-loss fallback can append at EOF when safe structured publication cannot be proven. Do NOT hand-edit the ledger for a park.
 3. Report according to the exit code:

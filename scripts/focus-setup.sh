@@ -1,10 +1,11 @@
 #!/bin/bash
-# focus-ledger: install (or remove) the one behavior that can't be a hook.
+# focus-ledger: install (or remove) the park-offer instruction.
 #
-# The commands and hooks cover the manual and event-driven parts. The remaining
-# behavior some people want — "when I pivot off an unfinished thread, offer to
-# park the old one" — needs the model's judgment about what a real pivot is, so
-# it can't be a hook. It lives as an instruction block in your CLAUDE.md instead.
+# Offering to park — the thread you pivot away from, or an idea you float
+# mid-task — needs the model's judgment about what a real pivot or idea is. A
+# UserPromptSubmit hook reminds the model when a message carries a cue phrase,
+# but most pivots and ideas carry none, so the rule itself lives as an
+# instruction block in your CLAUDE.md.
 #
 # This writes that block as a MANAGED, idempotent section (bracketed by
 # FOCUS-LEDGER markers) so re-running updates it in place rather than duplicating,

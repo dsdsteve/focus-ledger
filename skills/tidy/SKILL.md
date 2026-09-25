@@ -4,7 +4,7 @@ argument-hint: (no args) — report first, then one explicit confirmation before
 allowed-tools: Bash
 ---
 
-Scripts live in `${CLAUDE_PLUGIN_ROOT}/scripts/` in Claude Code. Outside Claude Code (for example in Kiro) `${CLAUDE_PLUGIN_ROOT}` is not set, so use `~/.kiro/skills/focus-ledger-shared` in its place.
+Scripts live in `${CLAUDE_PLUGIN_ROOT}/scripts/` in Claude Code. Outside Claude Code (for example in Kiro) `${CLAUDE_PLUGIN_ROOT}` is not set, so use `$HOME/.kiro/skills/focus-ledger-shared` in its place.
 
 Run the verify-report-confirm-apply flow exactly once.
 
