@@ -2,6 +2,7 @@
 # focus-ledger UserPromptSubmit hook: remind the model to offer parking when the
 # user floats a side idea or announces an aside. Soft only: never blocks, always
 # exits 0, and prints nothing unless a cue matches.
+[ "${FOCUS_PROMPT_NUDGE:-}" = off ] && exit 0
 in=$(cat) || exit 0
 
 # Match the prompt field only. Claude Code and Kiro both send it as "prompt",

@@ -103,6 +103,30 @@ Or test locally without installing:
 claude --plugin-dir ./focus-ledger
 ```
 
+### Kiro
+
+The same skill files load in Kiro, and both tools share one ledger at `~/.claude/focus-ledger.md`. There is no Kiro marketplace install, so copy the files from a clone of this repository:
+
+```bash
+git clone https://github.com/dsdsteve/focus-ledger && cd focus-ledger
+mkdir -p ~/.kiro/skills/focus-ledger-shared
+cp -R scripts hooks ~/.kiro/skills/focus-ledger-shared/
+for s in skills/*/; do
+  n=$(basename "$s")
+  mkdir -p ~/.kiro/skills/focus-ledger-"$n"
+  cp "$s"SKILL.md ~/.kiro/skills/focus-ledger-"$n"/
+done
+```
+
+Kiro hooks belong to an agent, so add these entries under `hooks` in the agent you use (`~/.kiro/agents/<agent>.json`):
+
+```json
+"agentSpawn": [{"command": "CLAUDE_PLUGIN_ROOT=$HOME/.kiro/skills/focus-ledger-shared $HOME/.kiro/skills/focus-ledger-shared/hooks/focus-session-start.sh", "timeout_ms": 5000}],
+"userPromptSubmit": [{"command": "$HOME/.kiro/skills/focus-ledger-shared/hooks/focus-prompt.sh", "timeout_ms": 5000}]
+```
+
+Kiro does not read `CLAUDE.md`, so `setup` has no effect there. Put the park-offer instruction in a steering file such as `~/.kiro/steering/focus-ledger.md`, using the text `setup` writes. Kiro discards Stop-hook output, so the stale-item nudge has no Kiro equivalent. To update, pull and re-run the copy.
+
 ## Uninstall and optional data removal
 
 1. Remove any optional pivot instruction you installed: run `/focus-ledger:setup local remove` in each project and/or `/focus-ledger:setup global remove`. This changes only the managed `CLAUDE.md` block; bare “uninstall” is not treated as setup removal.
@@ -118,6 +142,7 @@ All supported variables are optional:
 |---|---|
 | `FOCUS_STALE_DAYS=<n>` | Nonnegative decimal staleness threshold in local calendar days (default `7`; invalid or over-nine-digit values fall back to `7`). |
 | `FOCUS_STOP_NUDGE=off` | Exact value `off` disables the Stop stale nudge. Other values leave it enabled. |
+| `FOCUS_PROMPT_NUDGE=off` | Exact value `off` disables the UserPromptSubmit park reminders. Other values leave them enabled. The `setup` instruction is separate: remove it with `/focus-ledger:setup remove`. |
 | `FOCUS_WRITE_CHECK=on` | Emit the soft PreToolUse write note. Unset, `off`, and any value other than `on` or `strict` are silent. |
 | `FOCUS_WRITE_CHECK=strict` | Emit the same note and ask before each matched `Write`/`Edit`; it does not deny the operation. |
 | `FOCUS_NUDGE_COOLDOWN=<seconds>` | Stop-nudge cooldown (default `14400`). `0` disables cooldown suppression, so each eligible Stop may emit; invalid values fall back to `14400`. |

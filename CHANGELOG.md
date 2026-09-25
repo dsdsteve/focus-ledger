@@ -25,6 +25,11 @@ All notable changes to focus-ledger are documented here. Format follows
   model to offer to park a new idea or feature raised mid-task, which covers
   ideas that arrive without a cue phrase. Re-run `/focus-ledger:setup` to
   update an installed block.
+- `FOCUS_PROMPT_NUDGE=off` turns the prompt-hook reminders off. Removing the
+  `setup` block does not, because the two are separate.
+- README documents a manual Kiro install: copy the skills, scripts and hooks
+  into `~/.kiro/skills`, add two hook entries to your Kiro agent, and put the
+  park-offer instruction in a steering file.
 - The hook matches a fixed phrase list, so an unannounced pivot or idea still
   relies on the instruction. It reads prompt text, stores and transmits
   nothing, and never blocks.

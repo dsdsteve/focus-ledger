@@ -189,6 +189,8 @@ I|{"prompt":"quote \"would be nice\" here"}
 -|{"prompt":"fix \"the bug\"","cwd":"/x/btw"}
 -|not json at all
 PROMPT_CASES
+  prompt_out=$(printf '{"prompt":"btw would be nice"}' | FOCUS_PROMPT_NUDGE=off "$sh_bin" "$ROOT/hooks/focus-prompt.sh"); prompt_rc=$?
+  [ "$prompt_rc" = 0 ] && [ -z "$prompt_out" ] || { prompt_ok=0; prompt_why="$prompt_why; FOCUS_PROMPT_NUDGE=off did not silence (rc=$prompt_rc)"; }
   report_case "$sh_bin" "prompt hook: reads only the prompt; idea and pivot cues fire, ordinary text stays silent" "$prompt_ok" "${prompt_why#; }"
 }
 
@@ -3622,7 +3624,7 @@ run_release_consistency_checks() {
   done <<EOF_RUNTIME_VARS
 $static_runtime_vars
 EOF_RUNTIME_VARS
-  for static_public_var in FOCUS_ARCHIVE_DAYS FOCUS_NUDGE_COOLDOWN \
+  for static_public_var in FOCUS_ARCHIVE_DAYS FOCUS_NUDGE_COOLDOWN FOCUS_PROMPT_NUDGE \
     FOCUS_STALE_DAYS FOCUS_STOP_NUDGE FOCUS_WRITE_CHECK; do
     static_table_token="| \`$static_public_var"
     if ! grep -qF "$static_table_token" "$ROOT/README.md"; then
@@ -3635,7 +3637,7 @@ EOF_RUNTIME_VARS
     fi
   done
   static_expected_public_vars=$(printf '%s\n' FOCUS_ARCHIVE_DAYS \
-    FOCUS_NUDGE_COOLDOWN FOCUS_STALE_DAYS FOCUS_STOP_NUDGE FOCUS_WRITE_CHECK | sort -u)
+    FOCUS_NUDGE_COOLDOWN FOCUS_PROMPT_NUDGE FOCUS_STALE_DAYS FOCUS_STOP_NUDGE FOCUS_WRITE_CHECK | sort -u)
   static_table_public_vars=$(awk -F '`' '
     /^\| `FOCUS_[A-Z0-9_]+/ {
       name=$2
